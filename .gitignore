@@ -1,0 +1,14 @@
+﻿node_modules/
+.env
+.env.*
+!.env.example
+
+dist/
+build/
+.vscode/
+
+backend/generated/
+backend/.agents/
+backend/.claude/
+backend/.cursor/
+backend/.devin/

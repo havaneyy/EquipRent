@@ -1,0 +1,149 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model audit_logs {
+  audit_id   Int      @id @default(autoincrement())
+  user_id    Int
+  action     String   @db.VarChar(50)
+  table_name String   @db.VarChar(50)
+  record_id  Int
+  old_value  String?
+  new_value  String?
+  created_at DateTime @db.Timestamp(6)
+  users      users    @relation(fields: [user_id], references: [user_id], onDelete: NoAction, onUpdate: NoAction, map: "fk_audit_user")
+
+  @@index([user_id], map: "idx_audit_logs_user")
+}
+
+model customers {
+  customer_id   Int       @id @default(autoincrement())
+  user_id       Int       @unique
+  customer_type String?   @db.VarChar(50)
+  users         users     @relation(fields: [user_id], references: [user_id], onDelete: NoAction, onUpdate: NoAction, map: "fk_customers_user")
+  rentals       rentals[]
+}
+
+model equipment {
+  equipment_id         Int                   @id @default(autoincrement())
+  category_id          Int
+  equipment_name       String                @db.VarChar(100)
+  description          String?
+  rental_price         Decimal               @db.Decimal(10, 2)
+  equipment_status     String                @db.VarChar(30)
+  condition_status     String                @db.VarChar(30)
+  created_at           DateTime              @db.Timestamp(6)
+  equipment_categories equipment_categories  @relation(fields: [category_id], references: [category_id], onDelete: NoAction, onUpdate: NoAction, map: "fk_equipment_category")
+  maintenance_records  maintenance_records[]
+  rental_items         rental_items[]
+
+  @@index([equipment_status], map: "idx_equipment_status")
+}
+
+model equipment_categories {
+  category_id   Int         @id @default(autoincrement())
+  category_name String      @unique @db.VarChar(100)
+  description   String?
+  equipment     equipment[]
+}
+
+model maintenance_assignments {
+  assignment_id       Int                 @id @default(autoincrement())
+  maintenance_id      Int
+  technician_id       Int
+  assigned_at         DateTime            @db.Timestamp(6)
+  assignment_status   String              @db.VarChar(30)
+  maintenance_records maintenance_records @relation(fields: [maintenance_id], references: [maintenance_id], onDelete: NoAction, onUpdate: NoAction, map: "fk_assignment_maintenance")
+  users               users               @relation(fields: [technician_id], references: [user_id], onDelete: NoAction, onUpdate: NoAction, map: "fk_assignment_technician")
+}
+
+model maintenance_records {
+  maintenance_id          Int                       @id @default(autoincrement())
+  equipment_id            Int
+  requested_by            Int
+  maintenance_date        DateTime                  @db.Date
+  description             String?
+  maintenance_status      String                    @db.VarChar(30)
+  maintenance_assignments maintenance_assignments[]
+  equipment               equipment                 @relation(fields: [equipment_id], references: [equipment_id], onDelete: NoAction, onUpdate: NoAction, map: "fk_maintenance_equipment")
+  users                   users                     @relation(fields: [requested_by], references: [user_id], onDelete: NoAction, onUpdate: NoAction, map: "fk_maintenance_requested_by")
+
+  @@index([equipment_id], map: "idx_maintenance_equipment")
+}
+
+model payments {
+  payment_id     Int      @id @default(autoincrement())
+  rental_id      Int
+  payment_date   DateTime @db.Timestamp(6)
+  amount_paid    Decimal  @db.Decimal(10, 2)
+  payment_method String   @db.VarChar(50)
+  payment_status String   @db.VarChar(30)
+  rentals        rentals  @relation(fields: [rental_id], references: [rental_id], onDelete: NoAction, onUpdate: NoAction, map: "fk_payments_rental")
+
+  @@index([rental_id], map: "idx_payments_rental")
+}
+
+model rental_items {
+  rental_item_id Int       @id @default(autoincrement())
+  rental_id      Int
+  equipment_id   Int
+  rental_price   Decimal   @db.Decimal(10, 2)
+  item_condition String?   @db.VarChar(50)
+  equipment      equipment @relation(fields: [equipment_id], references: [equipment_id], onDelete: NoAction, onUpdate: NoAction, map: "fk_rental_items_equipment")
+  rentals        rentals   @relation(fields: [rental_id], references: [rental_id], onDelete: NoAction, onUpdate: NoAction, map: "fk_rental_items_rental")
+
+  @@index([equipment_id], map: "idx_rental_items_equipment")
+  @@index([rental_id], map: "idx_rental_items_rental")
+}
+
+model rentals {
+  rental_id            Int            @id @default(autoincrement())
+  customer_id          Int
+  staff_id             Int
+  rental_date          DateTime       @db.Date
+  expected_return_date DateTime       @db.Date
+  actual_return_date   DateTime?      @db.Date
+  rental_status        String         @db.VarChar(30)
+  total_amount         Decimal        @db.Decimal(10, 2)
+  payments             payments[]
+  rental_items         rental_items[]
+  customers            customers      @relation(fields: [customer_id], references: [customer_id], onDelete: NoAction, onUpdate: NoAction, map: "fk_rentals_customer")
+  users                users          @relation(fields: [staff_id], references: [user_id], onDelete: NoAction, onUpdate: NoAction, map: "fk_rentals_staff")
+
+  @@index([customer_id], map: "idx_rentals_customer")
+  @@index([staff_id], map: "idx_rentals_staff")
+  @@index([rental_status], map: "idx_rentals_status")
+}
+
+model roles {
+  role_id     Int     @id @default(autoincrement())
+  role_name   String  @unique @db.VarChar(50)
+  description String?
+  users       users[]
+}
+
+model users {
+  user_id                 Int                       @id @default(autoincrement())
+  role_id                 Int
+  first_name              String                    @db.VarChar(50)
+  last_name               String                    @db.VarChar(50)
+  username                String                    @unique @db.VarChar(50)
+  password_hash           String                    @db.VarChar(255)
+  email                   String                    @unique @db.VarChar(100)
+  phone_number            String?                   @db.VarChar(20)
+  street                  String?                   @db.VarChar(100)
+  barangay                String?                   @db.VarChar(100)
+  city                    String?                   @db.VarChar(100)
+  created_at              DateTime                  @db.Timestamp(6)
+  audit_logs              audit_logs[]
+  customers               customers?
+  maintenance_assignments maintenance_assignments[]
+  maintenance_records     maintenance_records[]
+  rentals                 rentals[]
+  roles                   roles                     @relation(fields: [role_id], references: [role_id], onDelete: NoAction, onUpdate: NoAction, map: "fk_users_role")
+}
