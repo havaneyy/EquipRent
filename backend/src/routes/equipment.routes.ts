@@ -3,6 +3,33 @@ import { Router } from "express";
 import { prisma } from "../lib/prisma";
 
 const router = Router();
+const equipmentStatuses = new Set(["AVAILABLE", "RENTED", "MAINTENANCE"]);
+const conditionStatuses = new Set(["GOOD", "FAIR", "POOR"]);
+
+function isPrismaErrorCode(error: unknown, code: string): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    error.code === code
+  );
+}
+
+function isRequestBody(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseNumber(value: unknown): number | null {
+  if (
+    (typeof value !== "number" && typeof value !== "string") ||
+    (typeof value === "string" && value.trim() === "")
+  ) {
+    return null;
+  }
+
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
 
 // GET /api/equipment - Get all equipment
 router.get("/", async (_req, res) => {
@@ -23,6 +50,7 @@ router.get("/", async (_req, res) => {
     });
   } catch (error) {
     console.error("Get equipment error:", error);
+
     res.status(500).json({
       success: false,
       message: "Failed to retrieve equipment.",
@@ -64,6 +92,7 @@ router.get("/:id", async (req, res) => {
     });
   } catch (error) {
     console.error("Get equipment error:", error);
+
     res.status(500).json({
       success: false,
       message: "Failed to retrieve equipment.",
@@ -73,6 +102,14 @@ router.get("/:id", async (req, res) => {
 
 // POST /api/equipment - Add new equipment
 router.post("/", async (req, res) => {
+  if (!isRequestBody(req.body)) {
+    res.status(400).json({
+      success: false,
+      message: "A valid equipment request body is required.",
+    });
+    return;
+  }
+
   const {
     category_id,
     equipment_name,
@@ -91,22 +128,24 @@ router.post("/", async (req, res) => {
   ) {
     res.status(400).json({
       success: false,
-      message:
-        "Category, equipment name, and rental price are required.",
+      message: "Category, equipment name, and rental price are required.",
     });
     return;
   }
 
-  const categoryId = Number(category_id);
-  const price = Number(rental_price);
+  const categoryId = parseNumber(category_id);
+  const price = parseNumber(rental_price);
 
   if (
+    categoryId === null ||
     !Number.isInteger(categoryId) ||
     categoryId < 1 ||
     typeof equipment_name !== "string" ||
     !equipment_name.trim() ||
-    !Number.isFinite(price) ||
-    price < 0
+    equipment_name.trim().length > 100 ||
+    price === null ||
+    price < 0 ||
+    price > 99_999_999.99
   ) {
     res.status(400).json({
       success: false,
@@ -127,11 +166,33 @@ router.post("/", async (req, res) => {
     return;
   }
 
+  if (
+    equipment_status !== undefined &&
+    (typeof equipment_status !== "string" ||
+      !equipmentStatuses.has(equipment_status))
+  ) {
+    res.status(400).json({
+      success: false,
+      message: "Please provide a valid equipment status.",
+    });
+    return;
+  }
+
+  if (
+    condition_status !== undefined &&
+    (typeof condition_status !== "string" ||
+      !conditionStatuses.has(condition_status))
+  ) {
+    res.status(400).json({
+      success: false,
+      message: "Please provide a valid condition status.",
+    });
+    return;
+  }
+
   try {
     const category = await prisma.equipment_categories.findUnique({
-      where: {
-        category_id: categoryId,
-      },
+      where: { category_id: categoryId },
     });
 
     if (!category) {
@@ -163,6 +224,14 @@ router.post("/", async (req, res) => {
       data: equipment,
     });
   } catch (error) {
+    if (isPrismaErrorCode(error, "P2003")) {
+      res.status(409).json({
+        success: false,
+        message: "The selected category is no longer available.",
+      });
+      return;
+    }
+
     console.error("Add equipment error:", error);
     console.error("Error details:", JSON.stringify(error, null, 2));
 
@@ -181,6 +250,14 @@ router.put("/:id", async (req, res) => {
     res.status(400).json({
       success: false,
       message: "Invalid equipment ID.",
+    });
+    return;
+  }
+
+  if (!isRequestBody(req.body)) {
+    res.status(400).json({
+      success: false,
+      message: "A valid equipment request body is required.",
     });
     return;
   }
@@ -217,9 +294,13 @@ router.put("/:id", async (req, res) => {
     } = {};
 
     if (category_id !== undefined) {
-      const categoryId = Number(category_id);
+      const categoryId = parseNumber(category_id);
 
-      if (!Number.isInteger(categoryId) || categoryId < 1) {
+      if (
+        categoryId === null ||
+        !Number.isInteger(categoryId) ||
+        categoryId < 1
+      ) {
         res.status(400).json({
           success: false,
           message: "Invalid category ID.",
@@ -245,11 +326,12 @@ router.put("/:id", async (req, res) => {
     if (equipment_name !== undefined) {
       if (
         typeof equipment_name !== "string" ||
-        !equipment_name.trim()
+        !equipment_name.trim() ||
+        equipment_name.trim().length > 100
       ) {
         res.status(400).json({
           success: false,
-          message: "Equipment name cannot be empty.",
+          message: "Equipment name must be between 1 and 100 characters.",
         });
         return;
       }
@@ -270,12 +352,12 @@ router.put("/:id", async (req, res) => {
     }
 
     if (rental_price !== undefined) {
-      const price = Number(rental_price);
+      const price = parseNumber(rental_price);
 
-      if (!Number.isFinite(price) || price < 0) {
+      if (price === null || price < 0 || price > 99_999_999.99) {
         res.status(400).json({
           success: false,
-          message: "Rental price must be a valid non-negative number.",
+          message: "Rental price must be between 0 and 99,999,999.99.",
         });
         return;
       }
@@ -284,10 +366,13 @@ router.put("/:id", async (req, res) => {
     }
 
     if (equipment_status !== undefined) {
-      if (typeof equipment_status !== "string") {
+      if (
+        typeof equipment_status !== "string" ||
+        !equipmentStatuses.has(equipment_status)
+      ) {
         res.status(400).json({
           success: false,
-          message: "Equipment status must be text.",
+          message: "Please provide a valid equipment status.",
         });
         return;
       }
@@ -296,10 +381,13 @@ router.put("/:id", async (req, res) => {
     }
 
     if (condition_status !== undefined) {
-      if (typeof condition_status !== "string") {
+      if (
+        typeof condition_status !== "string" ||
+        !conditionStatuses.has(condition_status)
+      ) {
         res.status(400).json({
           success: false,
-          message: "Condition status must be text.",
+          message: "Please provide a valid condition status.",
         });
         return;
       }
@@ -329,7 +417,24 @@ router.put("/:id", async (req, res) => {
       data: updatedEquipment,
     });
   } catch (error) {
+    if (isPrismaErrorCode(error, "P2025")) {
+      res.status(404).json({
+        success: false,
+        message: "Equipment not found.",
+      });
+      return;
+    }
+
+    if (isPrismaErrorCode(error, "P2003")) {
+      res.status(409).json({
+        success: false,
+        message: "The selected category is no longer available.",
+      });
+      return;
+    }
+
     console.error("Update equipment error:", error);
+    console.error("Error details:", JSON.stringify(error, null, 2));
 
     res.status(500).json({
       success: false,
@@ -338,11 +443,7 @@ router.put("/:id", async (req, res) => {
   }
 });
 
-
-/**
- * DELETE /api/equipment/:id
- * Delete an existing equipment record.
- */
+// DELETE /api/equipment/:id - Delete existing equipment
 router.delete("/:id", async (req, res) => {
   const equipmentId = Number(req.params.id);
 
@@ -355,24 +456,8 @@ router.delete("/:id", async (req, res) => {
   }
 
   try {
-    const existingEquipment = await prisma.equipment.findUnique({
-      where: {
-        equipment_id: equipmentId,
-      },
-    });
-
-    if (!existingEquipment) {
-      res.status(404).json({
-        success: false,
-        message: "Equipment not found.",
-      });
-      return;
-    }
-
-    await prisma.equipment.delete({
-      where: {
-        equipment_id: equipmentId,
-      },
+    const deletedEquipment = await prisma.equipment.delete({
+      where: { equipment_id: equipmentId },
     });
 
     res.json({
@@ -380,16 +465,32 @@ router.delete("/:id", async (req, res) => {
       message: "Equipment deleted successfully.",
       data: {
         equipment_id: equipmentId,
-        equipment_name: existingEquipment.equipment_name,
+        equipment_name: deletedEquipment.equipment_name,
       },
     });
   } catch (error) {
+    if (isPrismaErrorCode(error, "P2025")) {
+      res.status(404).json({
+        success: false,
+        message: "Equipment not found.",
+      });
+      return;
+    }
+
+    if (isPrismaErrorCode(error, "P2003")) {
+      res.status(409).json({
+        success: false,
+        message:
+          "This equipment is linked to rental or maintenance history and cannot be deleted without removing those records.",
+      });
+      return;
+    }
+
     console.error("Delete equipment error:", error);
 
     res.status(500).json({
       success: false,
-      message:
-        "Failed to delete equipment. It may be linked to existing rental or maintenance records.",
+      message: "Failed to delete equipment.",
     });
   }
 });
