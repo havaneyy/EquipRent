@@ -11,10 +11,10 @@
     "dev": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\"",
     "dev:backend": "node backend/server.js",
     "dev:frontend": "npm run --workspace=frontend dev",
-    "build": "npm run build:backend && npm run build:frontend",
-    "build:backend": "npx prisma generate --schema=backend/prisma/schema.prisma",
+    "build": "npm run --workspace=backend build && npm run --workspace=frontend build",
+    "build:backend": "npm run --workspace=backend build",
     "build:frontend": "npm run --workspace=frontend build",
-    "postinstall": "npx prisma generate --schema=backend/prisma/schema.prisma || true",
+    "postinstall": "npm run --workspace=backend build || true",
     "start": "node backend/server.js"
   },
   "dependencies": {
@@ -30,4 +30,3 @@
     "concurrently": "^9.1.2"
   }
 }
-

@@ -4,6 +4,7 @@
   "description": "EquipRent backend server",
   "main": "server.js",
   "scripts": {
+    "build": "prisma generate",
     "start": "node server.js",
     "dev": "node server.js"
   },
