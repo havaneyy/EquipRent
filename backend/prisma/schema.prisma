@@ -1,0 +1,168 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Role {
+  role_id     Int      @id @default(autoincrement())
+  role_name   String   @unique @db.VarChar(50)
+  description String?  @db.Text
+  created_at  DateTime @default(now()) @db.Timestamptz(6)
+  users       User[]
+
+  @@map("roles")
+}
+
+model User {
+  user_id                 Int                     @id @default(autoincrement())
+  role_id                 Int
+  first_name              String                  @db.VarChar(50)
+  last_name               String                  @db.VarChar(50)
+  username                String                  @unique @db.VarChar(50)
+  password_hash           String                  @db.VarChar(255)
+  email                   String                  @unique @db.VarChar(100)
+  phone_number            String?                 @db.VarChar(20)
+  street                  String?                 @db.VarChar(100)
+  barangay                String?                 @db.VarChar(100)
+  city                    String?                 @db.VarChar(100)
+  created_at              DateTime                @default(now()) @db.Timestamptz(6)
+  role                    Role                    @relation(fields: [role_id], references: [role_id], onDelete: Restrict, onUpdate: Cascade)
+  customer                Customer?
+  rentals                 Rental[]
+  maintenance_records     MaintenanceRecord[]
+  maintenance_assignments MaintenanceAssignment[]
+  audit_logs              AuditLog[]
+
+  @@index([role_id], map: "idx_users_role")
+  @@map("users")
+}
+
+model Customer {
+  customer_id   Int      @id @default(autoincrement())
+  user_id       Int      @unique
+  customer_type String   @default("Standard") @db.VarChar(50)
+  user          User     @relation(fields: [user_id], references: [user_id], onDelete: Cascade, onUpdate: Cascade)
+  rentals       Rental[]
+
+  @@map("customers")
+}
+
+model EquipmentCategory {
+  category_id   Int         @id @default(autoincrement())
+  category_name String      @unique @db.VarChar(100)
+  description   String?     @db.Text
+  equipment     Equipment[]
+
+  @@map("equipment_categories")
+}
+
+model Equipment {
+  equipment_id        Int                 @id @default(autoincrement())
+  category_id         Int
+  equipment_name      String              @db.VarChar(100)
+  description         String?             @db.Text
+  rental_price        Decimal             @db.Decimal(10, 2)
+  equipment_status    String              @default("Available") @db.VarChar(30)
+  condition_status    String              @default("Good") @db.VarChar(30)
+  created_at          DateTime            @default(now()) @db.Timestamptz(6)
+  category            EquipmentCategory   @relation(fields: [category_id], references: [category_id], onDelete: Restrict, onUpdate: Cascade)
+  rental_items        RentalItem[]
+  maintenance_records MaintenanceRecord[]
+
+  @@index([category_id], map: "idx_equipment_category")
+  @@index([equipment_status], map: "idx_equipment_status")
+  @@map("equipment")
+}
+
+model Rental {
+  rental_id              Int          @id @default(autoincrement())
+  customer_id            Int
+  staff_id               Int?
+  rental_date            DateTime     @default(dbgenerated("CURRENT_DATE")) @db.Date
+  expected_return_date   DateTime     @db.Date
+  actual_return_date     DateTime?    @db.Date
+  rental_status          String       @default("Reserved") @db.VarChar(30)
+  total_amount           Decimal      @db.Decimal(10, 2)
+  reservation_expires_at DateTime?    @db.Timestamptz(6)
+  customer               Customer     @relation(fields: [customer_id], references: [customer_id], onDelete: Restrict, onUpdate: Cascade)
+  staff                  User?        @relation(fields: [staff_id], references: [user_id], onDelete: Restrict, onUpdate: Cascade)
+  rental_items           RentalItem[]
+  payments               Payment[]
+
+  @@index([customer_id], map: "idx_rentals_customer")
+  @@index([rental_status], map: "idx_rentals_status")
+  @@map("rentals")
+}
+
+model RentalItem {
+  rental_item_id Int       @id @default(autoincrement())
+  rental_id      Int
+  equipment_id   Int
+  rental_price   Decimal   @db.Decimal(10, 2)
+  item_condition String?   @default("Good") @db.VarChar(50)
+  rental         Rental    @relation(fields: [rental_id], references: [rental_id], onDelete: Cascade, onUpdate: Cascade)
+  equipment      Equipment @relation(fields: [equipment_id], references: [equipment_id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@index([rental_id], map: "idx_rental_items_rental")
+  @@index([equipment_id], map: "idx_rental_items_equipment")
+  @@map("rental_items")
+}
+
+model Payment {
+  payment_id     Int       @id @default(autoincrement())
+  rental_id      Int
+  payment_date   DateTime  @default(now()) @db.Timestamptz(6)
+  amount_paid    Decimal   @db.Decimal(10, 2)
+  payment_method String    @db.VarChar(50)
+  payment_status String    @default("Completed") @db.VarChar(30)
+  rental         Rental    @relation(fields: [rental_id], references: [rental_id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@index([rental_id], map: "idx_payments_rental")
+  @@map("payments")
+}
+
+model MaintenanceRecord {
+  maintenance_id        Int                     @id @default(autoincrement())
+  equipment_id          Int
+  requested_by          Int
+  maintenance_date      DateTime                @default(dbgenerated("CURRENT_DATE")) @db.Date
+  description           String?                 @db.Text
+  maintenance_status    String                  @default("Pending") @db.VarChar(30)
+  equipment             Equipment               @relation(fields: [equipment_id], references: [equipment_id], onDelete: Restrict, onUpdate: Cascade)
+  requester             User                    @relation(fields: [requested_by], references: [user_id], onDelete: Restrict, onUpdate: Cascade)
+  maintenance_assignments MaintenanceAssignment[]
+
+  @@index([equipment_id], map: "idx_maintenance_equipment")
+  @@map("maintenance_records")
+}
+
+model MaintenanceAssignment {
+  assignment_id      Int               @id @default(autoincrement())
+  maintenance_id     Int
+  technician_id      Int
+  assigned_at        DateTime          @default(now()) @db.Timestamptz(6)
+  assignment_status  String            @default("Assigned") @db.VarChar(30)
+  maintenance_record MaintenanceRecord @relation(fields: [maintenance_id], references: [maintenance_id], onDelete: Cascade, onUpdate: Cascade)
+  technician         User              @relation(fields: [technician_id], references: [user_id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@map("maintenance_assignments")
+}
+
+model AuditLog {
+  audit_id   Int      @id @default(autoincrement())
+  user_id    Int?
+  action     String   @db.VarChar(50)
+  table_name String   @db.VarChar(50)
+  record_id  Int
+  old_value  String?  @db.Text
+  new_value  String?  @db.Text
+  created_at DateTime @default(now()) @db.Timestamptz(6)
+  user       User?    @relation(fields: [user_id], references: [user_id], onDelete: SetNull, onUpdate: Cascade)
+
+  @@index([table_name, record_id], map: "idx_audit_logs_table_record")
+  @@map("audit_logs")
+}
