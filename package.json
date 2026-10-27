@@ -1,0 +1,33 @@
+{
+  "name": "equiprent",
+  "version": "1.0.0",
+  "description": "EquipRent: Role-Based Equipment Rental & Maintenance Management System",
+  "private": true,
+  "workspaces": [
+    "backend",
+    "frontend"
+  ],
+  "scripts": {
+    "dev": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\"",
+    "dev:backend": "node backend/server.js",
+    "dev:frontend": "npm run --workspace=frontend dev",
+    "build": "npm run build:backend && npm run build:frontend",
+    "build:backend": "npx prisma generate --schema=backend/prisma/schema.prisma",
+    "build:frontend": "npm run --workspace=frontend build",
+    "postinstall": "npx prisma generate --schema=backend/prisma/schema.prisma || true",
+    "start": "node backend/server.js"
+  },
+  "dependencies": {
+    "@prisma/client": "^5.22.0",
+    "bcryptjs": "^3.0.3",
+    "cors": "^2.8.5",
+    "dotenv": "^18.0.9",
+    "express": "^4.21.2",
+    "jsonwebtoken": "^9.0.2",
+    "prisma": "^5.22.0"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}
+
