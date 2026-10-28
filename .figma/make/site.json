@@ -1,0 +1,10 @@
+{
+  "description": "Browse, reserve, and manage equipment rentals with availability tracking, rental status updates, and tools for customers, staff, and administrators.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}
