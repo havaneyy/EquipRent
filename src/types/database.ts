@@ -186,3 +186,10 @@ export interface FleetUtilizationAnalytics {
   utilization_percentage: number;
   total_revenue_generated: number;
 }
+
+export interface EquipmentBookedRange {
+  equipment_id: string;
+  start_date: string;
+  end_date: string;
+  block_type: 'reserved' | 'rented' | 'maintenance';
+}
