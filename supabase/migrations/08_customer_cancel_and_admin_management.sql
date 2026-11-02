@@ -27,3 +27,4 @@ CREATE POLICY pol_equipment_admin_crud ON public.equipment
     FOR ALL TO authenticated
     USING (public.fn_current_user_role() = 'admin')
     WITH CHECK (public.fn_current_user_role() = 'admin');
+
