@@ -2,6 +2,7 @@ import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import type {
   Equipment,
   EquipmentCategory,
+  EquipmentBookedRange,
   WarehouseLocation,
   RentalOrder,
   MaintenanceRecord,
@@ -92,6 +93,20 @@ export async function updateEquipmentStatus(
    RENTAL ORDERS DIRECT SUPABASE QUERIES
    ========================================================================= */
 
+export async function fetchEquipmentBookedRanges(): Promise<EquipmentBookedRange[]> {
+  const { data, error } = await getSupabaseClient().rpc('fn_get_equipment_booked_ranges');
+
+  if (error) {
+    console.warn(
+      'Supabase fn_get_equipment_booked_ranges unavailable (run supabase/migrations/09_fix_rls_and_double_booking.sql):',
+      error.message
+    );
+    return [];
+  }
+
+  return (data as EquipmentBookedRange[]) || [];
+}
+
 export async function fetchRentalOrders(customerId?: string): Promise<RentalOrder[]> {
   let query = getSupabaseClient()
     .from('rental_orders')
@@ -177,6 +192,28 @@ export async function createRentalOrder(params: {
 
   if (itemErr) {
     console.error('Supabase rental_order_items insert error:', itemErr.message);
+    // Clean up the draft order header so failed item inserts never leave orphan orders
+    await getSupabaseClient()
+      .from('rental_orders')
+      .delete()
+      .eq('id', orderData.id)
+      .eq('status', 'draft');
+
+    if (itemErr.message.includes('Double-Booking Violation')) {
+      throw new Error(
+        'This equipment is already reserved or rented during your selected dates. Please choose open dates on the calendar.'
+      );
+    }
+    if (itemErr.message.includes('Maintenance Conflict')) {
+      throw new Error(
+        'This equipment is scheduled for maintenance during your selected dates. Please choose different dates.'
+      );
+    }
+    if (itemErr.message.toLowerCase().includes('row-level security')) {
+      throw new Error(
+        'Database RLS policy blocked rental_order_items insert. Run supabase/migrations/09_fix_rls_and_double_booking.sql in your Supabase SQL Editor.'
+      );
+    }
     throw new Error(itemErr.message);
   }
 
@@ -638,6 +675,19 @@ export async function fetchUserProfiles(): Promise<UserProfile[]> {
 }
 
 export async function deleteUserProfile(userId: string): Promise<void> {
+  const { error: rpcError } = await getSupabaseClient().rpc('sp_admin_delete_user_profile', {
+    p_user_id: userId,
+  });
+
+  if (!rpcError) {
+    return;
+  }
+
+  if (!rpcError.message.includes('sp_admin_delete_user_profile')) {
+    console.error('Supabase sp_admin_delete_user_profile error:', rpcError.message);
+    throw new Error(rpcError.message);
+  }
+
   const { error } = await getSupabaseClient()
     .from('user_profiles')
     .delete()
@@ -658,24 +708,61 @@ export async function addStaffMember(params: {
 }): Promise<UserProfile> {
   const tempPassword = params.password || 'StaffPass123!';
 
-  // Try creating Auth user
+  // Use an isolated, non-persisting Supabase client so signing up a staff account
+  // never overwrites or signs out the active Administrator session.
   let authUserId: string | null = null;
-  try {
-    const { data: authData } = await getSupabaseClient().auth.signUp({
-      email: params.email,
-      password: tempPassword,
-      options: {
-        data: {
-          full_name: params.fullName,
-          phone: params.phone,
-          company_name: params.companyName || 'EquipRent Operations',
-          requested_role: 'staff',
+  if (supabaseUrl && supabaseAnonKey) {
+    try {
+      const isolatedAuthClient = createClient(supabaseUrl, supabaseAnonKey, {
+        auth: {
+          persistSession: false,
+          autoRefreshToken: false,
+          detectSessionInUrl: false,
         },
-      },
-    });
-    authUserId = authData?.user?.id ?? null;
-  } catch (authErr) {
-    console.warn('Auth sign up notice (may already exist or admin API not enabled):', authErr);
+      });
+      const { data: authData, error: signUpErr } = await isolatedAuthClient.auth.signUp({
+        email: params.email,
+        password: tempPassword,
+        options: {
+          data: {
+            full_name: params.fullName,
+            phone: params.phone,
+            company_name: params.companyName || 'EquipRent Operations',
+            requested_role: 'staff',
+          },
+        },
+      });
+      if (signUpErr && !signUpErr.message.toLowerCase().includes('already registered')) {
+        throw new Error(signUpErr.message);
+      }
+      authUserId = authData?.user?.id ?? null;
+    } catch (authErr) {
+      if (authErr instanceof Error && !authErr.message.toLowerCase().includes('already registered')) {
+        throw authErr;
+      }
+      console.warn('Auth sign up notice (user may already exist):', authErr);
+    }
+  }
+
+  // Promote/upsert staff profile via Admin SECURITY DEFINER RPC
+  const { data: rpcProfile, error: rpcErr } = await getSupabaseClient().rpc(
+    'sp_admin_upsert_staff_profile',
+    {
+      p_auth_user_id: authUserId,
+      p_full_name: params.fullName,
+      p_email: params.email,
+      p_phone: params.phone,
+      p_company_name: params.companyName || 'EquipRent Operations',
+    }
+  );
+
+  if (!rpcErr && rpcProfile) {
+    return rpcProfile as UserProfile;
+  }
+
+  if (rpcErr && !rpcErr.message.includes('sp_admin_upsert_staff_profile')) {
+    console.error('Supabase sp_admin_upsert_staff_profile error:', rpcErr.message);
+    throw new Error(rpcErr.message);
   }
 
   const newProfileId = authUserId || crypto.randomUUID();
@@ -690,7 +777,7 @@ export async function addStaffMember(params: {
         phone: params.phone,
         company_name: params.companyName || 'EquipRent Operations',
         role: 'staff',
-        requested_role: 'staff',
+        requested_role: null,
         account_status: 'active',
         updated_at: new Date().toISOString(),
       },
