@@ -69,6 +69,25 @@ export async function updateEquipmentStatus(
   equipmentId: string,
   newStatus: EquipmentStatus
 ): Promise<void> {
+  if (newStatus === 'available') {
+    const { data: currentEquip } = await getSupabaseClient()
+      .from('equipment')
+      .select('current_status')
+      .eq('id', equipmentId)
+      .maybeSingle();
+
+    if (currentEquip?.current_status === 'under_maintenance') {
+      throw new Error(
+        'This equipment is currently under maintenance. Mark it as Repaired in the Maintenance Queue to set it back to Available.'
+      );
+    }
+    if (currentEquip?.current_status === 'rented') {
+      throw new Error(
+        'This equipment is currently rented out. Process its return in Return & Inspection first.'
+      );
+    }
+  }
+
   const { data, error } = await getSupabaseClient()
     .from('equipment')
     .update({
@@ -107,6 +126,8 @@ export async function fetchEquipmentBookedRanges(): Promise<EquipmentBookedRange
   return (data as EquipmentBookedRange[]) || [];
 }
 
+const ARCHIVED_REMOVED_USER_ORDER_TAG = '[Archived: Customer Account Removed]';
+
 export async function fetchRentalOrders(customerId?: string): Promise<RentalOrder[]> {
   let query = getSupabaseClient()
     .from('rental_orders')
@@ -122,7 +143,9 @@ export async function fetchRentalOrders(customerId?: string): Promise<RentalOrde
     console.error('Supabase fetchRentalOrders error:', error.message);
     throw new Error(error.message);
   }
-  return (data as RentalOrder[]) || [];
+  return ((data as RentalOrder[]) || []).filter(
+    (order) => order.special_terms !== ARCHIVED_REMOVED_USER_ORDER_TAG
+  );
 }
 
 export async function createRentalOrder(params: {
@@ -136,7 +159,19 @@ export async function createRentalOrder(params: {
   deliveryAddress: string;
   customerName?: string;
   customerPhone?: string;
+  initialStatus?: 'draft' | 'confirmed';
+  authorizedStaffId?: string;
 }): Promise<RentalOrder> {
+  // Strict Past-Date Guard: Never allow booking on previous/past dates
+  const nowLocal = new Date();
+  const localToday = `${nowLocal.getFullYear()}-${String(nowLocal.getMonth() + 1).padStart(2, '0')}-${String(nowLocal.getDate()).padStart(2, '0')}`;
+  if (!params.startDate || params.startDate < localToday || params.endDate < params.startDate) {
+    throw new Error(
+      'Cannot rent on previous/past dates. Please choose today or a future start date.'
+    );
+  }
+
+  const orderStatus = params.initialStatus || 'draft';
   const orderNumber = `ORD-${new Date().getFullYear()}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
   const subtotal = Math.round(params.unitDailyRate * params.days * 100) / 100;
   const insurance = Math.round(params.dailyInsuranceRate * params.days * 100) / 100;
@@ -156,7 +191,8 @@ export async function createRentalOrder(params: {
       {
         order_number: orderNumber,
         customer_id: params.customerId,
-        status: 'draft',
+        authorized_staff_id: params.authorizedStaffId || null,
+        status: orderStatus,
         expected_start_date: params.startDate,
         expected_end_date: params.endDate,
         subtotal_amount: subtotal,
@@ -192,12 +228,17 @@ export async function createRentalOrder(params: {
 
   if (itemErr) {
     console.error('Supabase rental_order_items insert error:', itemErr.message);
-    // Clean up the draft order header so failed item inserts never leave orphan orders
-    await getSupabaseClient()
+    // Clean up the order header (or cancel if delete is restricted) so failed item inserts never leave orphan orders
+    const { error: delErr } = await getSupabaseClient()
       .from('rental_orders')
       .delete()
-      .eq('id', orderData.id)
-      .eq('status', 'draft');
+      .eq('id', orderData.id);
+    if (delErr) {
+      await getSupabaseClient()
+        .from('rental_orders')
+        .update({ status: 'cancelled', updated_at: new Date().toISOString() })
+        .eq('id', orderData.id);
+    }
 
     if (itemErr.message.includes('Double-Booking Violation')) {
       throw new Error(
@@ -278,6 +319,60 @@ export async function updateRentalOrderStatus(
   }
 }
 
+export async function rescheduleConfirmedOrderDates(
+  orderId: string,
+  newStartDate: string,
+  newEndDate: string
+): Promise<void> {
+  const { data, error } = await getSupabaseClient()
+    .from('rental_orders')
+    .update({
+      expected_start_date: newStartDate,
+      expected_end_date: newEndDate,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', orderId)
+    .in('status', ['draft', 'confirmed'])
+    .select('id')
+    .maybeSingle();
+
+  if (error) {
+    console.error('Supabase rescheduleConfirmedOrderDates error:', error.message);
+    if (error.message.includes('Double-Booking Violation')) {
+      throw new Error(
+        `Cannot move order to ${newStartDate} – ${newEndDate}: another reservation already overlaps those dates.`
+      );
+    }
+    throw new Error(error.message);
+  }
+
+  if (!data) {
+    throw new Error('Could not reschedule order dates. Verify your staff/admin permissions.');
+  }
+}
+
+export async function staffCancelConfirmedOrder(orderId: string): Promise<void> {
+  const { data, error } = await getSupabaseClient()
+    .from('rental_orders')
+    .update({
+      status: 'cancelled',
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', orderId)
+    .in('status', ['draft', 'confirmed'])
+    .select('id')
+    .maybeSingle();
+
+  if (error) {
+    console.error('Supabase staffCancelConfirmedOrder error:', error.message);
+    throw new Error(error.message);
+  }
+
+  if (!data) {
+    throw new Error('Order could not be cancelled.');
+  }
+}
+
 export async function executeRentalDispatch(
   orderId: string,
   staffId: string
@@ -297,24 +392,32 @@ export async function executeRentalDispatch(
 
 export async function executeEquipmentReturn(params: {
   orderItemId: string;
-  returnOdometer: number;
-  fuelLevel: number;
-  cleanliness: number;
-  integrity: number;
+  orderId?: string;
+  equipmentId?: string;
+  condition: 'okay' | 'damaged';
+  dispatchHours?: number | null;
   inspectorId: string;
-  damageNotes?: string;
+  notes?: string;
   penaltyFee?: number;
 }): Promise<{ maintenanceCreated: boolean }> {
+  const isDamaged = params.condition === 'damaged';
+  const safeHours = Math.max(0, Number(params.dispatchHours ?? 0));
+
   const { data, error } = await getSupabaseClient().rpc('sp_process_equipment_return', {
     p_order_item_id: params.orderItemId,
-    p_return_odometer: params.returnOdometer,
-    p_fuel_level: params.fuelLevel,
-    p_cleanliness: params.cleanliness,
-    p_integrity: params.integrity,
+    p_return_odometer: safeHours,
+    p_fuel_level: 100,
+    p_cleanliness: isDamaged ? 2 : 5,
+    p_integrity: isDamaged ? 1 : 5,
     p_inspector_id: params.inspectorId,
-    p_damage_notes: params.damageNotes ?? null,
-    p_penalty_fee: params.penaltyFee ?? 0,
+    // Only send damage_notes into RPC when actually damaged, so even pre-Migration-10 DBs
+    // never falsely mark an "Okay" return as damaged!
+    p_damage_notes: isDamaged
+      ? params.notes?.trim() || 'Returned damaged — requires maintenance check'
+      : null,
+    p_penalty_fee: isDamaged ? (params.penaltyFee ?? 0) : 0,
   });
+
   if (error) {
     console.error('Supabase return inspection error:', error.message);
     throw new Error(error.message);
@@ -323,7 +426,40 @@ export async function executeEquipmentReturn(params: {
     throw new Error('Supabase did not confirm the return inspection.');
   }
 
-  return { maintenanceCreated: data.maintenance_work_order_created === true };
+  const targetEquipmentId: string | undefined = params.equipmentId || data.equipment_id;
+  if (targetEquipmentId) {
+    // Guarantee the physical equipment status matches the chosen return condition
+    await getSupabaseClient()
+      .from('equipment')
+      .update({
+        current_status: isDamaged ? 'under_maintenance' : 'available',
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', targetEquipmentId);
+  }
+
+  // Guarantee parent rental_order is marked 'completed' when no items remain 'dispatched'
+  if (params.orderId) {
+    const { data: stillOut } = await getSupabaseClient()
+      .from('rental_order_items')
+      .select('id')
+      .eq('rental_order_id', params.orderId)
+      .eq('item_status', 'dispatched');
+
+    if (!stillOut || stillOut.length === 0) {
+      const todayStr = new Date().toISOString().slice(0, 10);
+      await getSupabaseClient()
+        .from('rental_orders')
+        .update({
+          status: 'completed',
+          actual_return_date: todayStr,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', params.orderId);
+    }
+  }
+
+  return { maintenanceCreated: isDamaged || data.maintenance_work_order_created === true };
 }
 
 /* =========================================================================
@@ -341,6 +477,63 @@ export async function fetchMaintenanceRecords(): Promise<MaintenanceRecord[]> {
     throw new Error(error.message);
   }
   return (data as MaintenanceRecord[]) || [];
+}
+
+export async function completeMaintenanceRepair(params: {
+  maintenanceId?: string;
+  equipmentId: string;
+}): Promise<void> {
+  const todayStr = new Date().toISOString().slice(0, 10);
+
+  if (params.maintenanceId) {
+    const { error: rpcErr } = await getSupabaseClient().rpc('sp_complete_maintenance_repair', {
+      p_maintenance_id: params.maintenanceId,
+    });
+
+    if (rpcErr && !rpcErr.message.includes('sp_complete_maintenance_repair')) {
+      console.error('Supabase sp_complete_maintenance_repair error:', rpcErr.message);
+      throw new Error(rpcErr.message);
+    }
+
+    if (rpcErr) {
+      const { error: maintErr } = await getSupabaseClient()
+        .from('maintenance_records')
+        .update({
+          maintenance_status: 'completed',
+          completed_date: todayStr,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', params.maintenanceId);
+
+      if (maintErr) {
+        throw new Error(maintErr.message);
+      }
+    }
+  } else {
+    // Complete any pending/in-progress maintenance records for this equipment unit
+    await getSupabaseClient()
+      .from('maintenance_records')
+      .update({
+        maintenance_status: 'completed',
+        completed_date: todayStr,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('equipment_id', params.equipmentId)
+      .in('maintenance_status', ['pending', 'in_progress']);
+  }
+
+  // Ensure the equipment unit is marked available immediately
+  const { error: equipErr } = await getSupabaseClient()
+    .from('equipment')
+    .update({
+      current_status: 'available',
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', params.equipmentId);
+
+  if (equipErr) {
+    throw new Error(equipErr.message);
+  }
 }
 
 /* =========================================================================
@@ -390,6 +583,10 @@ export async function getCurrentUserProfile(): Promise<UserProfile | null> {
   }
 
   if (linkedProfile) {
+    if (linkedProfile.account_status === 'suspended') {
+      await getSupabaseClient().auth.signOut();
+      return null;
+    }
     return linkedProfile as UserProfile;
   }
 
@@ -403,8 +600,13 @@ export async function getCurrentUserProfile(): Promise<UserProfile | null> {
     throw new Error(legacyProfileError.message);
   }
 
-  if (!legacyProfile || (legacyProfile.auth_user_id && legacyProfile.auth_user_id !== user.id)) {
-    throw new Error('Your authenticated account does not have an EquipRent profile.');
+  if (
+    !legacyProfile ||
+    legacyProfile.account_status === 'suspended' ||
+    (legacyProfile.auth_user_id && legacyProfile.auth_user_id !== user.id)
+  ) {
+    await getSupabaseClient().auth.signOut();
+    return null;
   }
 
   return legacyProfile as UserProfile;
@@ -450,13 +652,15 @@ export async function loginWithEmail(
     }
 
     if (legacyProfile?.auth_user_id && legacyProfile.auth_user_id !== authData.user.id) {
+      await getSupabaseClient().auth.signOut();
       throw new Error('Authenticated account is not linked to this EquipRent profile.');
     }
     profileData = legacyProfile;
   }
 
-  if (!profileData) {
-    throw new Error('Authenticated account found, but no EquipRent profile is linked to it.');
+  if (!profileData || profileData.account_status === 'suspended') {
+    await getSupabaseClient().auth.signOut();
+    throw new Error('This account has been removed by an administrator.');
   }
 
   return { profile: profileData as UserProfile };
@@ -665,6 +869,7 @@ export async function fetchUserProfiles(): Promise<UserProfile[]> {
   const { data, error } = await getSupabaseClient()
     .from('user_profiles')
     .select('*')
+    .neq('account_status', 'suspended')
     .order('created_at', { ascending: false });
 
   if (error) {
@@ -675,7 +880,10 @@ export async function fetchUserProfiles(): Promise<UserProfile[]> {
 }
 
 export async function deleteUserProfile(userId: string): Promise<void> {
-  const { error: rpcError } = await getSupabaseClient().rpc('sp_admin_delete_user_profile', {
+  const client = getSupabaseClient();
+
+  // 1. Primary path: Admin SECURITY DEFINER RPC (cascades linked orders/inspections in Migration 12)
+  const { error: rpcError } = await client.rpc('sp_admin_delete_user_profile', {
     p_user_id: userId,
   });
 
@@ -683,19 +891,138 @@ export async function deleteUserProfile(userId: string): Promise<void> {
     return;
   }
 
-  if (!rpcError.message.includes('sp_admin_delete_user_profile')) {
+  const isForeignKeyOrMissingRpc =
+    rpcError.message.includes('linked rental orders or inspection records') ||
+    rpcError.message.toLowerCase().includes('foreign key') ||
+    rpcError.message.includes('sp_admin_delete_user_profile');
+
+  if (!isForeignKeyOrMissingRpc) {
     console.error('Supabase sp_admin_delete_user_profile error:', rpcError.message);
     throw new Error(rpcError.message);
   }
 
-  const { error } = await getSupabaseClient()
+  // 2. Automatic client-side cleanup when Migration 12 has not been run yet:
+  //    Clean up all child records & foreign-key references, detach any historical order shells
+  //    via Admin's pol_orders_staff_update policy, and re-invoke sp_admin_delete_user_profile
+  //    so the user_profiles row is permanently deleted right away without needing SQL Editor steps.
+  let adminProfileId = (await getCurrentUserProfile())?.id ?? null;
+  if (!adminProfileId || adminProfileId === userId) {
+    const { data: fallbackAdmin } = await client
+      .from('user_profiles')
+      .select('id')
+      .eq('role', 'admin')
+      .neq('id', userId)
+      .limit(1)
+      .maybeSingle();
+    adminProfileId = fallbackAdmin?.id ?? null;
+  }
+
+  const { data: userOrders } = await client
+    .from('rental_orders')
+    .select('id, items:rental_order_items(id, equipment_id, item_status)')
+    .eq('customer_id', userId);
+
+  const orderIds = (userOrders || []).map((o) => o.id);
+  if (orderIds.length > 0) {
+    // Release any currently dispatched equipment back to available
+    for (const ord of userOrders || []) {
+      const items =
+        (ord.items as Array<{ id: string; equipment_id: string; item_status: string }>) || [];
+      for (const item of items) {
+        if (item.item_status === 'dispatched') {
+          await client
+            .from('equipment')
+            .update({ current_status: 'available', updated_at: new Date().toISOString() })
+            .eq('id', item.equipment_id)
+            .eq('current_status', 'rented');
+        }
+      }
+    }
+
+    await client.from('payment_transactions').delete().in('rental_order_id', orderIds);
+    // Deleting rental_order_items also ON DELETE CASCADEs linked equipment_inspections
+    await client.from('rental_order_items').delete().in('rental_order_id', orderIds);
+    await client.from('rental_orders').delete().eq('customer_id', userId);
+
+    // If pre-Migration-12 RLS lacks an Admin DELETE policy on rental_orders, detach the empty
+    // order shells from userId using pol_orders_staff_update so zero FKs reference userId.
+    if (adminProfileId && adminProfileId !== userId) {
+      await client
+        .from('rental_orders')
+        .update({
+          customer_id: adminProfileId,
+          authorized_staff_id: null,
+          status: 'cancelled',
+          subtotal_amount: 0,
+          insurance_amount: 0,
+          tax_amount: 0,
+          security_deposit_amount: 0,
+          total_amount: 0,
+          special_terms: ARCHIVED_REMOVED_USER_ORDER_TAG,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('customer_id', userId);
+    }
+  }
+
+  // Delete RESTRICT child rows if removing a Staff member with past inspections/tasks
+  await client.from('equipment_inspections').delete().eq('inspector_id', userId);
+  await client.from('maintenance_tasks').delete().eq('technician_id', userId);
+
+  // Clear nullable staff/manager references
+  await client
+    .from('rental_orders')
+    .update({ authorized_staff_id: null })
+    .eq('authorized_staff_id', userId);
+  await client
+    .from('payment_transactions')
+    .update({ processed_by: null })
+    .eq('processed_by', userId);
+  await client
+    .from('maintenance_records')
+    .update({ lead_technician_id: null })
+    .eq('lead_technician_id', userId);
+  await client
+    .from('warehouse_locations')
+    .update({ manager_id: null })
+    .eq('manager_id', userId);
+
+  // 3. Re-run SECURITY DEFINER RPC now that all FK references to userId are cleared!
+  const { error: retryRpcError } = await client.rpc('sp_admin_delete_user_profile', {
+    p_user_id: userId,
+  });
+
+  if (!retryRpcError) {
+    return;
+  }
+
+  // 4. Legacy pre-Migration-09 fallback: direct delete or suspend on user_profiles
+  const { error: hardDeleteErr } = await client
     .from('user_profiles')
     .delete()
     .eq('id', userId);
 
-  if (error) {
-    console.error('Supabase deleteUserProfile error:', error.message);
-    throw new Error(error.message);
+  if (!hardDeleteErr) {
+    return;
+  }
+
+  const { error: archiveErr } = await client
+    .from('user_profiles')
+    .update({
+      account_status: 'suspended',
+      auth_user_id: null,
+      email: `removed-${userId.slice(0, 8)}-${Date.now()}@deleted.equiprent.local`,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', userId);
+
+  if (archiveErr) {
+    console.error(
+      'Supabase deleteUserProfile error:',
+      retryRpcError.message,
+      archiveErr.message
+    );
+    throw new Error(retryRpcError.message || archiveErr.message);
   }
 }
 
@@ -708,13 +1035,24 @@ export async function addStaffMember(params: {
 }): Promise<UserProfile> {
   const tempPassword = params.password || 'StaffPass123!';
 
-  // Use an isolated, non-persisting Supabase client so signing up a staff account
-  // never overwrites or signs out the active Administrator session.
+  // Use an isolated, non-persisting Supabase client with an in-memory storage key so
+  // signing up a staff account never overwrites or signs out the active Admin session.
   let authUserId: string | null = null;
   if (supabaseUrl && supabaseAnonKey) {
     try {
+      const memoryStore = new Map<string, string>();
       const isolatedAuthClient = createClient(supabaseUrl, supabaseAnonKey, {
         auth: {
+          storageKey: 'equiprent-admin-staff-provisioning',
+          storage: {
+            getItem: (key) => memoryStore.get(key) ?? null,
+            setItem: (key, value) => {
+              memoryStore.set(key, value);
+            },
+            removeItem: (key) => {
+              memoryStore.delete(key);
+            },
+          },
           persistSession: false,
           autoRefreshToken: false,
           detectSessionInUrl: false,
@@ -727,7 +1065,7 @@ export async function addStaffMember(params: {
           data: {
             full_name: params.fullName,
             phone: params.phone,
-            company_name: params.companyName || 'EquipRent Operations',
+            company_name: params.companyName || 'EquipRent Studio Operations',
             requested_role: 'staff',
           },
         },
@@ -752,7 +1090,7 @@ export async function addStaffMember(params: {
       p_full_name: params.fullName,
       p_email: params.email,
       p_phone: params.phone,
-      p_company_name: params.companyName || 'EquipRent Operations',
+      p_company_name: params.companyName || 'EquipRent Studio Operations',
     }
   );
 
@@ -762,6 +1100,11 @@ export async function addStaffMember(params: {
 
   if (rpcErr && !rpcErr.message.includes('sp_admin_upsert_staff_profile')) {
     console.error('Supabase sp_admin_upsert_staff_profile error:', rpcErr.message);
+    if (rpcErr.message.toLowerCase().includes('permission denied for table user_profiles')) {
+      throw new Error(
+        'Database permission error on user_profiles. Run supabase/migrations/10_fix_staff_return_maintenance_and_cameras.sql in your Supabase SQL Editor.'
+      );
+    }
     throw new Error(rpcErr.message);
   }
 
@@ -773,9 +1116,9 @@ export async function addStaffMember(params: {
         id: newProfileId,
         auth_user_id: authUserId,
         full_name: params.fullName,
-        email: params.email,
+        email: params.email.trim().toLowerCase(),
         phone: params.phone,
-        company_name: params.companyName || 'EquipRent Operations',
+        company_name: params.companyName || 'EquipRent Studio Operations',
         role: 'staff',
         requested_role: null,
         account_status: 'active',
@@ -788,6 +1131,11 @@ export async function addStaffMember(params: {
 
   if (profileErr) {
     console.error('Supabase addStaffMember error:', profileErr.message);
+    if (profileErr.message.toLowerCase().includes('permission denied for table user_profiles')) {
+      throw new Error(
+        'Database permission error on user_profiles. Run supabase/migrations/10_fix_staff_return_maintenance_and_cameras.sql in your Supabase SQL Editor.'
+      );
+    }
     throw new Error(profileErr.message);
   }
 

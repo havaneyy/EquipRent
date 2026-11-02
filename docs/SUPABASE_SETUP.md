@@ -25,7 +25,7 @@ EquipRent is a React/Vite application that reads live records from Supabase usin
 
 ## Existing Supabase project
 
-Do not run the destructive full-schema script on an existing project. Apply `supabase/migrations/06_order_insurance_totals.sql`, `supabase/migrations/07_signup_role_requests.sql`, `supabase/migrations/08_customer_cancel_and_admin_management.sql`, and `supabase/migrations/09_fix_rls_and_double_booking.sql` in the SQL Editor. Migration `09` fixes customer `rental_order_items` RLS inserts, enforces strict per-customer isolation, prevents cross-account double booking on reserved dates, and installs secure RPCs for calendar availability and admin staff management. Existing records are not deleted by these migrations.
+Do not run the destructive full-schema script on an existing project. Apply `supabase/migrations/06_order_insurance_totals.sql`, `supabase/migrations/07_signup_role_requests.sql`, `supabase/migrations/08_customer_cancel_and_admin_management.sql`, `supabase/migrations/09_fix_rls_and_double_booking.sql`, `supabase/migrations/10_fix_staff_return_maintenance_and_cameras.sql`, `supabase/migrations/11_booking_guards_and_maintenance_lock.sql`, and `supabase/migrations/12_fix_admin_remove_user_cascade.sql` in the SQL Editor. Migration `12` updates `sp_admin_delete_user_profile` so administrators can cleanly remove customer or staff accounts even when they have linked rental orders, payments, or inspection records.
 
 ## Auth and permissions
 

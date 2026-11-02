@@ -19,14 +19,16 @@ import {
   createEquipment,
   updateEquipmentDetails,
   deleteEquipment,
-  updateEquipmentStatus,
   fetchRentalOrders,
   createRentalOrder,
   cancelRentalOrder,
   updateRentalOrderStatus,
+  rescheduleConfirmedOrderDates,
+  staffCancelConfirmedOrder,
   executeRentalDispatch,
   executeEquipmentReturn,
   fetchMaintenanceRecords,
+  completeMaintenanceRepair,
   fetchAuditLogs,
   fetchUserProfiles,
   deleteUserProfile,
@@ -112,6 +114,7 @@ export default function App() {
 
   // Booking form state with Name & Contact Number & Future Date validation
   const todayDate = toDateInputValue(new Date());
+  const [bookSelectedCustomerId, setBookSelectedCustomerId] = useState('');
   const [bookCustomerName, setBookCustomerName] = useState('');
   const [bookCustomerPhone, setBookCustomerPhone] = useState('');
   const [bookDays, setBookDays] = useState('');
@@ -132,13 +135,11 @@ export default function App() {
   const [profileSaving, setProfileSaving] = useState(false);
 
   // Return inspection form state
-  const [returnOdometer, setReturnOdometer] = useState('');
-  const [returnFuel, setReturnFuel] = useState('');
-  const [returnCleanliness, setReturnCleanliness] = useState('');
-  const [returnIntegrity, setReturnIntegrity] = useState('');
+  const [returnCondition, setReturnCondition] = useState<'okay' | 'damaged'>('okay');
   const [damageNotes, setDamageNotes] = useState<string>('');
   const [penaltyFee, setPenaltyFee] = useState('');
   const [returnPhysicallyReceived, setReturnPhysicallyReceived] = useState(false);
+  const [maintenanceUpdatingId, setMaintenanceUpdatingId] = useState<string | null>(null);
 
   // Staff merged orders & requests filters
   const [staffOrderFilter, setStaffOrderFilter] = useState<
@@ -195,7 +196,9 @@ export default function App() {
         fetchEquipmentBookedRanges().catch(() => []),
         currentRole === 'customer' ? Promise.resolve([]) : fetchMaintenanceRecords(),
         currentRole === 'admin' ? fetchAuditLogs().catch(() => []) : Promise.resolve([]),
-        currentRole === 'admin' ? fetchUserProfiles().catch(() => []) : Promise.resolve([]),
+        currentRole === 'admin' || currentRole === 'staff'
+          ? fetchUserProfiles().catch(() => [])
+          : Promise.resolve([]),
       ]);
       setEquipmentList(eq);
       setCategoriesList(cats);
@@ -287,7 +290,7 @@ export default function App() {
               customerPhone: ord.customer?.phone || 'N/A',
               startDate: ord.expected_start_date,
               endDate: ord.expected_end_date,
-              deliveryAddress: ord.delivery_address || 'Depot',
+              deliveryAddress: ord.delivery_address || 'Studio Pickup',
               status: item.item_status,
             });
           }
@@ -296,6 +299,132 @@ export default function App() {
     });
     return list;
   }, [orders]);
+
+  // Return & Inspection rows (only dispatched items out with customers + returned/damaged history)
+  const returnableOrderItems = useMemo(() => {
+    const rows: Array<{
+      orderId: string;
+      orderNumber: string;
+      customerName: string;
+      customerPhone: string;
+      startDate: string;
+      endDate: string;
+      itemId: string;
+      equipmentId: string;
+      equipmentName: string;
+      serialNumber: string;
+      itemStatus: string;
+      dispatchHours: number | null;
+      conditionNotes?: string | null;
+    }> = [];
+
+    orders.forEach((ord) => {
+      ord.items?.forEach((item) => {
+        if (
+          item.item_status === 'dispatched' ||
+          item.item_status === 'returned' ||
+          item.item_status === 'damaged'
+        ) {
+          rows.push({
+            orderId: ord.id,
+            orderNumber: ord.order_number,
+            customerName: ord.customer?.full_name || 'Customer',
+            customerPhone: ord.customer?.phone || '',
+            startDate: ord.expected_start_date,
+            endDate: ord.expected_end_date,
+            itemId: item.id,
+            equipmentId: item.equipment_id,
+            equipmentName: item.equipment?.model_name || 'Equipment',
+            serialNumber: item.equipment?.serial_number || '—',
+            itemStatus: item.item_status,
+            dispatchHours: item.dispatch_odometer_hours ?? null,
+            conditionNotes: item.condition_notes,
+          });
+        }
+      });
+    });
+
+    // Sort active 'dispatched' items first so Staff sees items awaiting return at the top
+    return rows.sort((a, b) => {
+      if (a.itemStatus === 'dispatched' && b.itemStatus !== 'dispatched') return -1;
+      if (a.itemStatus !== 'dispatched' && b.itemStatus === 'dispatched') return 1;
+      return 0;
+    });
+  }, [orders]);
+
+  // Unified Maintenance Queue: combines maintenance_records + any equipment marked under_maintenance
+  const maintenanceQueueItems = useMemo(() => {
+    const openEquipmentIds = new Set<string>();
+    const rows: Array<{
+      key: string;
+      maintenanceId?: string;
+      workOrderNumber: string;
+      equipmentId: string;
+      equipmentName: string;
+      serialNumber: string;
+      maintenanceType: string;
+      notes: string;
+      scheduledDate: string;
+      status: 'pending' | 'in_progress' | 'completed' | 'cancelled';
+    }> = [];
+
+    for (const m of maintenance) {
+      if (m.maintenance_status === 'pending' || m.maintenance_status === 'in_progress') {
+        openEquipmentIds.add(m.equipment_id);
+      }
+      const matchedEquip = equipmentList.find((e) => e.id === m.equipment_id) || m.equipment;
+      rows.push({
+        key: m.id,
+        maintenanceId: m.id,
+        workOrderNumber: m.work_order_number,
+        equipmentId: m.equipment_id,
+        equipmentName: matchedEquip?.model_name || 'Equipment',
+        serialNumber: matchedEquip?.serial_number || '—',
+        maintenanceType: m.maintenance_type,
+        notes: m.service_description || 'Inspection / repair required',
+        scheduledDate: m.scheduled_date,
+        status: m.maintenance_status,
+      });
+    }
+
+    // Also surface any equipment unit currently set to 'under_maintenance' without an open work order
+    for (const eq of equipmentList) {
+      if (eq.current_status === 'under_maintenance' && !openEquipmentIds.has(eq.id)) {
+        rows.unshift({
+          key: `eq-maint-${eq.id}`,
+          maintenanceId: undefined,
+          workOrderNumber: 'MANUAL-MAINT',
+          equipmentId: eq.id,
+          equipmentName: eq.model_name,
+          serialNumber: eq.serial_number,
+          maintenanceType: 'corrective',
+          notes: 'Marked Under Maintenance — ready to verify & restore',
+          scheduledDate: todayDate,
+          status: 'pending',
+        });
+      }
+    }
+
+    // Keep open repairs on top, completed below
+    return rows.sort((a, b) => {
+      const aOpen = a.status === 'pending' || a.status === 'in_progress' ? 0 : 1;
+      const bOpen = b.status === 'pending' || b.status === 'in_progress' ? 0 : 1;
+      return aOpen - bOpen;
+    });
+  }, [maintenance, equipmentList, todayDate]);
+
+  const activeMaintenanceCount = useMemo(
+    () =>
+      maintenanceQueueItems.filter(
+        (m) => m.status === 'pending' || m.status === 'in_progress'
+      ).length,
+    [maintenanceQueueItems]
+  );
+
+  const activeDispatchedCount = useMemo(
+    () => returnableOrderItems.filter((r) => r.itemStatus === 'dispatched').length,
+    [returnableOrderItems]
+  );
 
   // Returned Items tracking
   const returnedItems = useMemo(() => {
@@ -357,6 +486,7 @@ export default function App() {
     }
     if (currentRole === 'staff') {
       const pendingReviewCount = orders.filter((o) => o.status === 'draft').length;
+      const readyDispatchCount = orders.filter((o) => o.status === 'confirmed').length;
       return [
         { label: 'Dashboard' },
         { label: 'Fleet Inventory' },
@@ -364,11 +494,17 @@ export default function App() {
           label: 'Orders & Requests',
           badge: pendingReviewCount ? String(pendingReviewCount) : undefined,
         },
-        { label: 'Dispatch & Checkout' },
-        { label: 'Return & Inspection' },
+        {
+          label: 'Dispatch & Checkout',
+          badge: readyDispatchCount ? String(readyDispatchCount) : undefined,
+        },
+        {
+          label: 'Return & Inspection',
+          badge: activeDispatchedCount ? String(activeDispatchedCount) : undefined,
+        },
         {
           label: 'Maintenance Queue',
-          badge: maintenance.length ? String(maintenance.length) : undefined,
+          badge: activeMaintenanceCount ? String(activeMaintenanceCount) : undefined,
         },
         { label: 'My Profile' },
       ];
@@ -379,11 +515,14 @@ export default function App() {
       { label: 'Fleet Inventory' },
       { label: 'Borrowed & Returned Items' },
       { label: 'User Management' },
-      { label: 'Maintenance Oversight' },
+      {
+        label: 'Maintenance Oversight',
+        badge: activeMaintenanceCount ? String(activeMaintenanceCount) : undefined,
+      },
       { label: 'Engine Audit Logs', badge: auditLogs.length ? String(auditLogs.length) : undefined },
       { label: 'My Profile' },
     ];
-  }, [currentRole, orders, maintenance.length, auditLogs.length]);
+  }, [currentRole, orders, activeDispatchedCount, activeMaintenanceCount, auditLogs.length]);
 
   // Enforce strict role-based page/tab isolation so accounts can never view unauthorized pages
   useEffect(() => {
@@ -490,28 +629,65 @@ export default function App() {
     showToast(`Welcome back, ${profile.full_name}!`);
   };
 
-  // 1. Customer Booking Submit with Future Date & Double-Booking Overlap Validation
+  const customerAccounts = useMemo(
+    () => usersList.filter((u) => u.role === 'customer' && u.account_status === 'active'),
+    [usersList]
+  );
+
+  // Open reservation modal for either Customer (self) or Staff (booking on behalf of a Customer)
+  const openBookingModal = (equip: Equipment, preferredStartDate?: string) => {
+    if (!currentUser) return;
+    const liveToday = toDateInputValue(new Date());
+    const safeStart =
+      preferredStartDate && preferredStartDate >= liveToday
+        ? preferredStartDate
+        : findNextAvailableDate(equip.id);
+
+    setRentingEquipment(equip);
+    setBookStartDate(safeStart < liveToday ? liveToday : safeStart);
+    setBookDays('1');
+
+    if (currentRole === 'staff') {
+      const firstCust = customerAccounts[0];
+      setBookSelectedCustomerId(firstCust?.id || '');
+      setBookCustomerName(firstCust?.full_name || '');
+      setBookCustomerPhone(firstCust?.phone || '');
+    } else {
+      setBookSelectedCustomerId(currentUser.id);
+      setBookCustomerName(currentUser.full_name);
+      setBookCustomerPhone(currentUser.phone);
+    }
+  };
+
+  // 1. Customer or Staff-on-behalf-of-Customer Booking Submit with Strict Past-Date & Overlap Validation
   const handleBookingSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!rentingEquipment || !currentUser) return;
     try {
+      const liveToday = toDateInputValue(new Date());
+      const isStaffBooking = currentRole === 'staff';
+      const targetCustomerId = isStaffBooking ? bookSelectedCustomerId : currentUser.id;
+
+      if (isStaffBooking && !targetCustomerId) {
+        throw new Error('Please select a Customer account to create this reservation for.');
+      }
       if (!bookCustomerName.trim()) {
-        throw new Error('Please enter your full name for the reservation confirmation.');
+        throw new Error('Please enter the customer full name for the reservation confirmation.');
       }
       if (!bookCustomerPhone.trim()) {
-        throw new Error('Please enter your contact phone number.');
+        throw new Error('Please enter the contact phone number.');
       }
       const parsedDays = Number(bookDays);
       if (bookDays === '' || !Number.isInteger(parsedDays) || parsedDays < 1 || parsedDays > 30) {
         throw new Error('Rental duration must be between 1 and 30 days.');
       }
       if (!bookAddress.trim()) {
-        throw new Error('Enter the job site or delivery address.');
+        throw new Error('Enter the shoot location or delivery address.');
       }
-      // Strict Date Validation: Only today or future dates! Cannot book yesterday!
-      if (bookStartDate < todayDate) {
+      // Strict Date Validation: Never allow past/previous dates!
+      if (!bookStartDate || bookStartDate < liveToday) {
         throw new Error(
-          'Rental start date cannot be in the past (yesterday or earlier). Please choose today or a future date.'
+          `Cannot rent on previous dates (${bookStartDate || 'invalid'}). Please choose today (${liveToday}) or a future date.`
         );
       }
       const start = new Date(`${bookStartDate}T00:00:00`);
@@ -519,7 +695,21 @@ export default function App() {
         throw new Error('Choose a valid rental start date.');
       }
       const startDateStr = toDateInputValue(start);
+      if (startDateStr < liveToday) {
+        throw new Error(
+          `Cannot rent on previous dates. Please choose today (${liveToday}) or a future date.`
+        );
+      }
       const endDateStr = addDaysToDateStr(startDateStr, parsedDays - 1);
+
+      if (
+        rentingEquipment.current_status === 'under_maintenance' ||
+        rentingEquipment.current_status === 'decommissioned'
+      ) {
+        throw new Error(
+          'This equipment is currently under maintenance and must be marked as Repaired in Maintenance Queue before renting.'
+        );
+      }
 
       const overlapReason = doesRangeOverlapBooking(rentingEquipment.id, startDateStr, endDateStr);
       if (overlapReason) {
@@ -533,7 +723,7 @@ export default function App() {
       const dailyInsuranceRate = rentingEquipment.category?.base_daily_insurance_rate ?? 0;
 
       await createRentalOrder({
-        customerId: currentUser.id,
+        customerId: targetCustomerId,
         equipmentId: rentingEquipment.id,
         unitDailyRate: rentingEquipment.daily_rental_rate,
         dailyInsuranceRate,
@@ -543,12 +733,18 @@ export default function App() {
         deliveryAddress: bookAddress,
         customerName: bookCustomerName,
         customerPhone: formatPhilippinePhone(bookCustomerPhone),
+        initialStatus: isStaffBooking ? 'confirmed' : 'draft',
+        authorizedStaffId: isStaffBooking ? currentUser.id : undefined,
       });
 
-      showToast(`Reservation submitted for ${rentingEquipment.model_name}! Status is Pending.`);
+      showToast(
+        isStaffBooking
+          ? `Reservation created & confirmed for ${bookCustomerName}! Ready in Dispatch & Checkout.`
+          : `Reservation submitted for ${rentingEquipment.model_name}! Status is Pending.`
+      );
       setRentingEquipment(null);
       await reloadData();
-      setActiveTab('My Reservations');
+      setActiveTab(isStaffBooking ? 'Orders & Requests' : 'My Reservations');
     } catch (err: unknown) {
       showToast(err instanceof Error ? err.message : 'Booking failed');
     }
@@ -605,90 +801,124 @@ export default function App() {
     }
   };
 
-  // 5. Staff Dispatches Equipment (Validation: Cannot dispatch past/expired orders)
+  // 5. Staff Dispatches Equipment (Validation: Cannot dispatch past/expired orders without rescheduling)
   const handleDispatchCheckout = async (orderId: string) => {
     if (!currentUser) return;
     try {
       const targetOrder = orders.find((o) => o.id === orderId);
       if (targetOrder && targetOrder.expected_end_date < todayDate) {
-        throw new Error('Cannot dispatch this order: the rental end date has already passed.');
+        throw new Error(
+          'Rental end date has already passed. Click "Move to Today & Dispatch" to shift the rental dates to today.'
+        );
       }
       await executeRentalDispatch(orderId, currentUser.id);
-      showToast('Equipment successfully dispatched to customer.');
+      showToast('Equipment checked out and handed off to customer.');
       await reloadData();
     } catch (err: unknown) {
       showToast(err instanceof Error ? err.message : 'Dispatch failed');
     }
   };
 
-  // 6. Staff Return Inspection (Validation: Staff can ONLY press return if equipment has physically returned)
+  // 5b. One-click fix for Expired Confirmed Orders: shift dates to start today & dispatch immediately
+  const handleRescheduleAndDispatch = async (order: RentalOrder) => {
+    if (!currentUser) return;
+    setReservationUpdating(true);
+    try {
+      const bookedDays = Math.max(1, order.items?.[0]?.days_rented || 1);
+      const newStartDate = todayDate;
+      const newEndDate = addDaysToDateStr(todayDate, bookedDays - 1);
+
+      await rescheduleConfirmedOrderDates(order.id, newStartDate, newEndDate);
+      await executeRentalDispatch(order.id, currentUser.id);
+      showToast(
+        `Order rescheduled to ${newStartDate} → ${newEndDate} and dispatched to customer!`
+      );
+      await reloadData();
+    } catch (err: unknown) {
+      showToast(err instanceof Error ? err.message : 'Could not reschedule and dispatch order.');
+    } finally {
+      setReservationUpdating(false);
+    }
+  };
+
+  // 5c. Cancel an Expired Confirmed Order if customer did not pick up
+  const handleCancelExpiredOrder = async (orderId: string) => {
+    if (
+      !window.confirm(
+        'Cancel this expired reservation so the equipment dates are freed up?'
+      )
+    ) {
+      return;
+    }
+    setReservationUpdating(true);
+    try {
+      await staffCancelConfirmedOrder(orderId);
+      showToast('Expired order cancelled.');
+      await reloadData();
+    } catch (err: unknown) {
+      showToast(err instanceof Error ? err.message : 'Could not cancel expired order.');
+    } finally {
+      setReservationUpdating(false);
+    }
+  };
+
+  // 6. Staff Return Inspection (Okay -> Available immediately; Damaged -> Under Maintenance + Work Order)
   const handleReturnSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!returningItemId || !currentUser) return;
     try {
       if (!returnPhysicallyReceived) {
         throw new Error(
-          'Verification Required: You can only complete return after confirming the equipment has been physically received at the depot.'
+          'Verification Required: Confirm that the customer has physically returned this equipment first.'
         );
       }
-      if (
-        returnOdometer === '' ||
-        returnFuel === '' ||
-        returnCleanliness === '' ||
-        returnIntegrity === ''
-      ) {
-        throw new Error(
-          'Enter the observed odometer, fuel level, cleanliness, and integrity before submitting.'
-        );
+      const parsedPenaltyFee =
+        returnCondition === 'damaged' && penaltyFee !== '' ? Number(penaltyFee) : 0;
+      if (!Number.isFinite(parsedPenaltyFee) || parsedPenaltyFee < 0) {
+        throw new Error('Enter a valid non-negative damage penalty amount.');
       }
-      const parsedOdometer = Number(returnOdometer);
-      const parsedFuel = Number(returnFuel);
-      const parsedCleanliness = Number(returnCleanliness);
-      const parsedIntegrity = Number(returnIntegrity);
-      const parsedPenaltyFee = penaltyFee === '' ? 0 : Number(penaltyFee);
-      if (
-        !Number.isFinite(parsedOdometer) ||
-        parsedOdometer < 0 ||
-        !Number.isInteger(parsedFuel) ||
-        parsedFuel < 0 ||
-        parsedFuel > 100 ||
-        !Number.isInteger(parsedCleanliness) ||
-        parsedCleanliness < 1 ||
-        parsedCleanliness > 5 ||
-        !Number.isInteger(parsedIntegrity) ||
-        parsedIntegrity < 1 ||
-        parsedIntegrity > 5 ||
-        !Number.isFinite(parsedPenaltyFee) ||
-        parsedPenaltyFee < 0
-      ) {
-        throw new Error('Enter valid inspection values within the displayed ranges.');
-      }
+
+      const targetRow = returnableOrderItems.find((r) => r.itemId === returningItemId);
+
       const res = await executeEquipmentReturn({
         orderItemId: returningItemId,
-        returnOdometer: parsedOdometer,
-        fuelLevel: parsedFuel,
-        cleanliness: parsedCleanliness,
-        integrity: parsedIntegrity,
+        orderId: targetRow?.orderId,
+        equipmentId: targetRow?.equipmentId,
+        condition: returnCondition,
+        dispatchHours: targetRow?.dispatchHours,
         inspectorId: currentUser.id,
-        damageNotes: damageNotes || undefined,
+        notes: damageNotes || undefined,
         penaltyFee: parsedPenaltyFee,
       });
+
       showToast(
         res.maintenanceCreated
-          ? 'Damage noted. Maintenance work order created.'
-          : 'Return completed.'
+          ? 'Rental Completed! Damaged item moved to Maintenance Queue until marked as Repaired.'
+          : 'Rental Completed! Equipment is now Available in Inventory.'
       );
       setReturningItemId(null);
-      setReturnOdometer('');
-      setReturnFuel('');
-      setReturnCleanliness('');
-      setReturnIntegrity('');
+      setReturnCondition('okay');
       setDamageNotes('');
       setPenaltyFee('');
       setReturnPhysicallyReceived(false);
       await reloadData();
     } catch (err: unknown) {
-      showToast(err instanceof Error ? err.message : 'Return inspection failed');
+      showToast(err instanceof Error ? err.message : 'Return check-in failed');
+    }
+  };
+
+  // 6b. Mark Under-Maintenance Equipment as Repaired -> Automatically sets Equipment to Available
+  const handleMarkMaintenanceFixed = async (equipmentId: string, maintenanceId?: string) => {
+    const busyKey = maintenanceId || equipmentId;
+    setMaintenanceUpdatingId(busyKey);
+    try {
+      await completeMaintenanceRepair({ maintenanceId, equipmentId });
+      showToast('Equipment marked as Repaired and automatically set to Available in Inventory!');
+      await reloadData();
+    } catch (err: unknown) {
+      showToast(err instanceof Error ? err.message : 'Could not mark equipment as repaired.');
+    } finally {
+      setMaintenanceUpdatingId(null);
     }
   };
 
@@ -888,10 +1118,11 @@ export default function App() {
   // Booking calculations for modal
   const bookingInsuranceRate = rentingEquipment?.category?.base_daily_insurance_rate ?? 0;
   const bookingDays = Number(bookDays) || 0;
+  const bookingPastDateError = Boolean(!bookStartDate || bookStartDate < todayDate);
   const bookingEndDate =
     bookStartDate && bookingDays >= 1 ? addDaysToDateStr(bookStartDate, bookingDays - 1) : '';
   const bookingOverlapReason =
-    rentingEquipment && bookStartDate
+    rentingEquipment && bookStartDate && !bookingPastDateError
       ? doesRangeOverlapBooking(
           rentingEquipment.id,
           bookStartDate,
@@ -1093,10 +1324,10 @@ export default function App() {
               </h1>
               <span className="greeting-sub">
                 {currentRole === 'customer'
-                  ? 'Heavy equipment fleet catalog & reservation hub'
+                  ? 'Camera, lighting, audio & studio equipment rental hub'
                   : currentRole === 'staff'
-                    ? 'Fleet operations, dispatch, returns & order reviews'
-                    : 'System oversight, asset management & user control'}
+                    ? 'Equipment operations, dispatch handoff, returns & maintenance'
+                    : 'Studio inventory oversight, equipment catalog & user control'}
               </span>
             </div>
 
@@ -1301,7 +1532,7 @@ export default function App() {
                               <div style={{ fontSize: 11, color: '#64748b' }}>Returned by: {r.customerName}</div>
                             </div>
                             <div style={{ textAlign: 'right' }}>
-                              <span className="confirmed-status-badge">Returned {r.returnDate}</span>
+                              <span className="completed-status-badge">✓ Completed &bull; {r.returnDate}</span>
                             </div>
                           </div>
                         ))}
@@ -1357,17 +1588,18 @@ export default function App() {
                           <button
                             className="reserve-purple-btn"
                             style={{ padding: '6px 14px', fontSize: 11 }}
-                            onClick={() => {
-                              setRentingEquipment(item);
-                              setBookStartDate(findNextAvailableDate(item.id));
-                              setBookCustomerName(currentUser.full_name);
-                              setBookCustomerPhone(currentUser.phone);
-                            }}
+                            onClick={() => openBookingModal(item)}
                           >
                             Reserve
                           </button>
                         ) : (
-                          <span className="confirmed-status-badge">Ready</span>
+                          <button
+                            className="reserve-purple-btn"
+                            style={{ padding: '6px 14px', fontSize: 11 }}
+                            onClick={() => openBookingModal(item)}
+                          >
+                            Rent for Customer
+                          </button>
                         )}
                       </div>
                     ))}
@@ -1500,12 +1732,7 @@ export default function App() {
                             <button
                               className="reserve-purple-btn"
                               disabled={item.current_status !== 'available'}
-                              onClick={() => {
-                                setRentingEquipment(item);
-                                setBookStartDate(findNextAvailableDate(item.id));
-                                setBookCustomerName(currentUser.full_name);
-                                setBookCustomerPhone(currentUser.phone);
-                              }}
+                              onClick={() => openBookingModal(item)}
                               style={{ opacity: item.current_status === 'available' ? 1 : 0.4 }}
                             >
                               Reserve
@@ -1513,25 +1740,38 @@ export default function App() {
                           )}
 
                           {currentRole === 'staff' && (
-                            <button
-                              className="reserve-purple-btn"
-                              onClick={async () => {
-                                try {
-                                  await updateEquipmentStatus(
-                                    item.id,
-                                    item.current_status === 'available' ? 'under_maintenance' : 'available'
-                                  );
-                                  showToast('Equipment status updated.');
-                                  await reloadData();
-                                } catch (error: unknown) {
+                            item.current_status === 'available' ? (
+                              <button
+                                className="reserve-purple-btn"
+                                onClick={() => openBookingModal(item)}
+                              >
+                                Rent for Customer
+                              </button>
+                            ) : item.current_status === 'under_maintenance' ? (
+                              <button
+                                type="button"
+                                className="outline-pill-btn"
+                                style={{
+                                  padding: '6px 10px',
+                                  fontSize: 11,
+                                  borderColor: '#f59e0b',
+                                  color: '#b45309',
+                                  background: '#fffbeb',
+                                  fontWeight: 700,
+                                }}
+                                onClick={() => {
+                                  setActiveTab('Maintenance Queue');
                                   showToast(
-                                    error instanceof Error ? error.message : 'Could not update status.'
+                                    'Click "Mark as Repaired" in Maintenance Queue to set this item back to Available.'
                                   );
-                                }
-                              }}
-                            >
-                              Toggle State
-                            </button>
+                                }}
+                                title="Under maintenance — must be marked as Repaired in Maintenance Queue"
+                              >
+                                🔧 Repair in Queue &rarr;
+                              </button>
+                            ) : (
+                              <span className="in-progress-status-badge">Out on Rent</span>
+                            )
                           )}
 
                           {currentRole === 'admin' && (
@@ -1753,21 +1993,20 @@ export default function App() {
                     </p>
                   </div>
 
-                  {currentRole === 'customer' ? (
+                  {currentRole === 'customer' || currentRole === 'staff' ? (
                     <button
                       className="primary-purple-btn"
                       disabled={selectedDateBlocked}
                       style={{ opacity: selectedDateBlocked ? 0.5 : 1, cursor: selectedDateBlocked ? 'not-allowed' : 'pointer' }}
-                      onClick={() => {
-                        setRentingEquipment(selectedCalEquip);
-                        setBookStartDate(calSelectedDate);
-                        setBookCustomerName(currentUser.full_name);
-                        setBookCustomerPhone(currentUser.phone);
-                      }}
+                      onClick={() => openBookingModal(selectedCalEquip, calSelectedDate)}
                     >
-                      {selectedDateBlockReason
-                        ? `Unavailable on ${calSelectedDate}`
-                        : `Reserve on ${calSelectedDate}`}
+                      {calSelectedDate < todayDate
+                        ? `Past Date — Unavailable`
+                        : selectedDateBlockReason
+                          ? `Unavailable on ${calSelectedDate}`
+                          : currentRole === 'staff'
+                            ? `Rent for Customer on ${calSelectedDate}`
+                            : `Reserve on ${calSelectedDate}`}
                     </button>
                   ) : (
                     <span className={selectedDateBlocked ? 'pending-status-badge' : 'confirmed-status-badge'}>
@@ -1835,7 +2074,7 @@ export default function App() {
                             ) : o.status === 'in_progress' ? (
                               <span className="in-progress-status-badge">🚚 Dispatched</span>
                             ) : o.status === 'completed' ? (
-                              <span className="completed-status-badge">Completed</span>
+                              <span className="completed-status-badge">✓ Completed</span>
                             ) : (
                               <span className="cancelled-status-badge">Cancelled</span>
                             )}
@@ -1853,6 +2092,10 @@ export default function App() {
                             ) : o.status === 'confirmed' || o.status === 'in_progress' ? (
                               <span style={{ fontSize: 11, color: '#047857', fontWeight: 600 }}>
                                 Confirmed (Locked)
+                              </span>
+                            ) : o.status === 'completed' ? (
+                              <span style={{ fontSize: 11, color: '#047857', fontWeight: 700 }}>
+                                ✓ Completed
                               </span>
                             ) : (
                               <span style={{ fontSize: 11, color: '#9ca3af' }}>—</span>
@@ -1882,6 +2125,21 @@ export default function App() {
                   <h3 className="chart-card-title">Orders & Reservation Requests</h3>
                 </div>
                 <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center' }}>
+                  <button
+                    type="button"
+                    className="primary-purple-btn"
+                    style={{ padding: '8px 16px', fontSize: 12 }}
+                    onClick={() => {
+                      const firstAvailable = availableEquipment[0];
+                      if (!firstAvailable) {
+                        showToast('No available equipment in inventory right now.');
+                        return;
+                      }
+                      openBookingModal(firstAvailable);
+                    }}
+                  >
+                    + Rent for Customer
+                  </button>
                   <input
                     type="text"
                     placeholder="Search customer, order #, equipment..."
@@ -1956,7 +2214,14 @@ export default function App() {
                           </td>
                           <td>{equipName}</td>
                           <td>
-                            {ord.expected_start_date} &rarr; {ord.expected_end_date}
+                            <div>
+                              {ord.expected_start_date} &rarr; {ord.expected_end_date}
+                            </div>
+                            {ord.status === 'confirmed' && ord.expected_end_date < todayDate && (
+                              <small style={{ color: '#dc2626', fontWeight: 700, fontSize: 10 }}>
+                                ⚠ End date passed
+                              </small>
+                            )}
                           </td>
                           <td style={{ fontWeight: 800, color: 'var(--purple-main)' }}>
                             {formatPHP(totalDue)}
@@ -1967,15 +2232,15 @@ export default function App() {
                             ) : ord.status === 'confirmed' ? (
                               <span className="confirmed-status-badge">✓ Confirmed</span>
                             ) : ord.status === 'in_progress' ? (
-                              <span className="in-progress-status-badge">🚚 Dispatched</span>
+                              <span className="in-progress-status-badge">📦 Out on Rent</span>
                             ) : ord.status === 'completed' ? (
-                              <span className="completed-status-badge">Completed</span>
+                              <span className="completed-status-badge">✓ Completed</span>
                             ) : (
                               <span className="cancelled-status-badge">Cancelled</span>
                             )}
                           </td>
                           <td>
-                            <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                            <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
                               {ord.status === 'draft' ? (
                                 <>
                                   <button
@@ -1996,20 +2261,46 @@ export default function App() {
                                   </button>
                                 </>
                               ) : ord.status === 'confirmed' ? (
-                                <button
-                                  className="primary-purple-btn"
-                                  style={{ padding: '5px 12px', fontSize: 11 }}
-                                  onClick={() => handleDispatchCheckout(ord.id)}
-                                  title="Dispatch to customer"
-                                >
-                                  Dispatch &rarr;
-                                </button>
+                                ord.expected_end_date < todayDate ? (
+                                  <>
+                                    <button
+                                      className="primary-purple-btn"
+                                      style={{ padding: '5px 10px', fontSize: 11 }}
+                                      onClick={() => handleRescheduleAndDispatch(ord)}
+                                      disabled={reservationUpdating}
+                                      title="Shift rental start date to today for the booked duration and dispatch now"
+                                    >
+                                      ↻ Move to Today &amp; Dispatch
+                                    </button>
+                                    <button
+                                      className="reject-btn"
+                                      onClick={() => handleCancelExpiredOrder(ord.id)}
+                                      disabled={reservationUpdating}
+                                      title="Cancel expired reservation"
+                                    >
+                                      ✕ Cancel
+                                    </button>
+                                  </>
+                                ) : (
+                                  <button
+                                    className="primary-purple-btn"
+                                    style={{ padding: '5px 12px', fontSize: 11 }}
+                                    onClick={() => handleDispatchCheckout(ord.id)}
+                                    title="Hand off equipment to customer"
+                                  >
+                                    Dispatch &rarr;
+                                  </button>
+                                )
                               ) : ord.status === 'in_progress' ? (
                                 <span style={{ fontSize: 11, color: '#1d4ed8', fontWeight: 600 }}>
-                                  Active on Site
+                                  Out with Customer
+                                </span>
+                              ) : ord.status === 'completed' ? (
+                                <span style={{ fontSize: 11, color: '#047857', fontWeight: 700 }}>
+                                  ✓ Completed
                                 </span>
                               ) : (
-                                <span style={{ fontSize: 11, color: '#9ca3af' }}>Archived</span>
+                                <span style={{ fontSize: 11, color: '#9ca3af' }}>Cancelled</span>
                               )}
                             </div>
                           </td>
@@ -2034,7 +2325,11 @@ export default function App() {
             <div className="transactions-table-card" style={{ marginTop: 6 }}>
               <div className="table-card-header">
                 <div>
-                  <h3 className="chart-card-title">Dispatch Operations</h3>
+                  <h3 className="chart-card-title">Dispatch &amp; Equipment Handoff</h3>
+                  <p style={{ margin: '4px 0 0', fontSize: 12, color: 'var(--text-muted)' }}>
+                    Use this tab when a customer arrives to pick up (or receive) an approved reservation. Clicking
+                    Complete Dispatch marks the equipment as Rented / Out with Customer.
+                  </p>
                 </div>
               </div>
 
@@ -2043,6 +2338,7 @@ export default function App() {
                   <thead>
                     <tr>
                       <th>ORDER NUMBER</th>
+                      <th>EQUIPMENT</th>
                       <th>CUSTOMER</th>
                       <th>RENTAL DATES</th>
                       <th>STATUS</th>
@@ -2051,51 +2347,119 @@ export default function App() {
                   </thead>
                   <tbody>
                     {orders
-                      .filter((ord) => ord.status === 'confirmed' || ord.status === 'in_progress')
-                      .map((ord) => (
-                        <tr key={ord.id}>
-                          <td>
-                            <strong>{ord.order_number}</strong>
-                          </td>
-                          <td>
-                            <div>
-                              <strong>{ord.customer?.full_name || '—'}</strong>
-                            </div>
-                            <small style={{ color: 'var(--text-muted)' }}>
-                              {ord.customer?.phone ? formatPhilippinePhone(ord.customer.phone) : '—'}
-                            </small>
-                          </td>
-                          <td>
-                            {ord.expected_start_date} &rarr; {ord.expected_end_date}
-                          </td>
-                          <td>
-                            {ord.status === 'confirmed' ? (
-                              <span className="confirmed-status-badge">Ready for Dispatch</span>
-                            ) : (
-                              <span className="in-progress-status-badge">Dispatched</span>
-                            )}
-                          </td>
-                          <td>
-                            {ord.status === 'confirmed' ? (
-                              <button
-                                className="primary-purple-btn"
-                                style={{ padding: '6px 14px', fontSize: 11 }}
-                                onClick={() => handleDispatchCheckout(ord.id)}
-                              >
-                                Complete Dispatch
-                              </button>
-                            ) : (
-                              <span style={{ color: '#047857', fontSize: 11, fontWeight: 600 }}>
-                                Dispatched
-                              </span>
-                            )}
-                          </td>
-                        </tr>
-                      ))}
-                    {orders.filter((ord) => ord.status === 'confirmed' || ord.status === 'in_progress').length ===
-                      0 && (
+                      .filter(
+                        (ord) =>
+                          ord.status === 'confirmed' ||
+                          ord.status === 'in_progress' ||
+                          ord.status === 'completed'
+                      )
+                      .sort((a, b) => {
+                        const rank = (s: string) =>
+                          s === 'confirmed' ? 0 : s === 'in_progress' ? 1 : 2;
+                        return rank(a.status) - rank(b.status);
+                      })
+                      .map((ord) => {
+                        const isExpired = ord.status === 'confirmed' && ord.expected_end_date < todayDate;
+                        const equipLabel = ord.items?.[0]?.equipment?.model_name || 'Equipment';
+                        return (
+                          <tr key={ord.id}>
+                            <td>
+                              <strong>{ord.order_number}</strong>
+                            </td>
+                            <td>
+                              <strong>{equipLabel}</strong>
+                            </td>
+                            <td>
+                              <div>
+                                <strong>{ord.customer?.full_name || '—'}</strong>
+                              </div>
+                              <small style={{ color: 'var(--text-muted)' }}>
+                                {ord.customer?.phone ? formatPhilippinePhone(ord.customer.phone) : '—'}
+                              </small>
+                            </td>
+                            <td>
+                              <div>
+                                {ord.expected_start_date} &rarr; {ord.expected_end_date}
+                              </div>
+                              {isExpired && (
+                                <small
+                                  style={{
+                                    display: 'inline-block',
+                                    marginTop: 3,
+                                    color: '#dc2626',
+                                    fontWeight: 700,
+                                    fontSize: 11,
+                                  }}
+                                >
+                                  ⚠ Rental end date passed — reschedule to today or cancel
+                                </small>
+                              )}
+                            </td>
+                            <td>
+                              {ord.status === 'confirmed' ? (
+                                isExpired ? (
+                                  <span className="cancelled-status-badge">Dates Expired</span>
+                                ) : (
+                                  <span className="confirmed-status-badge">Ready for Pickup</span>
+                                )
+                              ) : ord.status === 'in_progress' ? (
+                                <span className="in-progress-status-badge">Out with Customer</span>
+                              ) : (
+                                <span className="completed-status-badge">✓ Completed</span>
+                              )}
+                            </td>
+                            <td>
+                              {ord.status === 'confirmed' ? (
+                                isExpired ? (
+                                  <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+                                    <button
+                                      className="primary-purple-btn"
+                                      style={{ padding: '6px 12px', fontSize: 11 }}
+                                      onClick={() => handleRescheduleAndDispatch(ord)}
+                                      disabled={reservationUpdating}
+                                      title="Move rental dates to start today and dispatch immediately"
+                                    >
+                                      ↻ Move to Today &amp; Dispatch
+                                    </button>
+                                    <button
+                                      className="reject-btn"
+                                      onClick={() => handleCancelExpiredOrder(ord.id)}
+                                      disabled={reservationUpdating}
+                                      title="Cancel expired order"
+                                    >
+                                      ✕ Cancel Order
+                                    </button>
+                                  </div>
+                                ) : (
+                                  <button
+                                    className="primary-purple-btn"
+                                    style={{ padding: '6px 14px', fontSize: 11 }}
+                                    onClick={() => handleDispatchCheckout(ord.id)}
+                                  >
+                                    Complete Dispatch
+                                  </button>
+                                )
+                              ) : ord.status === 'in_progress' ? (
+                                <span style={{ color: '#1d4ed8', fontSize: 11, fontWeight: 600 }}>
+                                  Handed Off (Active)
+                                </span>
+                              ) : (
+                                <span style={{ color: '#047857', fontSize: 11, fontWeight: 700 }}>
+                                  ✓ Completed
+                                </span>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    {orders.filter(
+                      (ord) =>
+                        ord.status === 'confirmed' ||
+                        ord.status === 'in_progress' ||
+                        ord.status === 'completed'
+                    ).length === 0 && (
                       <tr>
-                        <td colSpan={5} style={{ textAlign: 'center', padding: 30, color: 'var(--text-muted)' }}>
+                        <td colSpan={6} style={{ textAlign: 'center', padding: 30, color: 'var(--text-muted)' }}>
                           No orders currently awaiting dispatch.
                         </td>
                       </tr>
@@ -2106,12 +2470,16 @@ export default function App() {
             </div>
           )}
 
-          {/* TAB 7: RETURN & INSPECTION (STAFF CAN ONLY PRESS RETURN IF EQUIPMENT HAS RETURNED) */}
+          {/* TAB 7: RETURN & INSPECTION (CHECK-IN WHEN CUSTOMER RETURNS EQUIPMENT) */}
           {currentRole === 'staff' && activeTab === 'Return & Inspection' && (
             <div className="transactions-table-card" style={{ marginTop: 6 }}>
               <div className="table-card-header">
                 <div>
-                  <h3 className="chart-card-title">Equipment Returns & Depot Inspection</h3>
+                  <h3 className="chart-card-title">Equipment Returns &amp; Check-In</h3>
+                  <p style={{ margin: '4px 0 0', fontSize: 12, color: 'var(--text-muted)' }}>
+                    Click Return Equipment when a customer brings gear back. Returned as Okay sets the item back to
+                    Available immediately; Returned as Damaged sends it to Maintenance Queue.
+                  </p>
                 </div>
               </div>
 
@@ -2119,69 +2487,86 @@ export default function App() {
                 <table className="finset-table">
                   <thead>
                     <tr>
-                      <th>ITEM ID</th>
-                      <th>MACHINERY MODEL</th>
+                      <th>ORDER #</th>
+                      <th>EQUIPMENT</th>
+                      <th>CUSTOMER</th>
+                      <th>RENTAL DATES</th>
                       <th>STATUS</th>
-                      <th>DISPATCH HOURS</th>
                       <th>RETURN ACTION</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {orders
-                      .flatMap((o) => o.items || [])
-                      .map((item) => (
-                        <tr key={item.id}>
-                          <td>
-                            <code>{item.id.slice(0, 8)}</code>
-                          </td>
-                          <td>
-                            <strong>{item.equipment?.model_name || '—'}</strong>
-                          </td>
-                          <td>
-                            {item.item_status === 'dispatched' ? (
-                              <span className="in-progress-status-badge">Currently on Rent</span>
-                            ) : item.item_status === 'returned' ? (
-                              <span className="confirmed-status-badge">Returned to Depot</span>
-                            ) : item.item_status === 'damaged' ? (
-                              <span className="cancelled-status-badge">Returned Damaged</span>
-                            ) : (
-                              <span className="pending-status-badge">{item.item_status}</span>
-                            )}
-                          </td>
-                          <td>
-                            {item.dispatch_odometer_hours ?? '—'}
-                            {item.dispatch_odometer_hours == null ? '' : ' hrs'}
-                          </td>
-                          <td>
-                            {item.item_status === 'dispatched' ? (
-                              <button
-                                className="primary-purple-btn"
-                                style={{ padding: '6px 14px', fontSize: 11 }}
-                                onClick={() => {
-                                  setReturningItemId(item.id);
-                                  setReturnOdometer('');
-                                  setReturnFuel('');
-                                  setReturnCleanliness('');
-                                  setReturnIntegrity('');
-                                  setDamageNotes('');
-                                  setPenaltyFee('');
-                                  setReturnPhysicallyReceived(false);
+                    {returnableOrderItems.map((row) => (
+                      <tr key={row.itemId}>
+                        <td>
+                          <strong>{row.orderNumber}</strong>
+                        </td>
+                        <td>
+                          <div>
+                            <strong>{row.equipmentName}</strong>
+                          </div>
+                          <small style={{ color: 'var(--text-muted)' }}>S/N: {row.serialNumber}</small>
+                        </td>
+                        <td>
+                          <div>
+                            <strong>{row.customerName}</strong>
+                          </div>
+                          {row.customerPhone && (
+                            <small style={{ color: 'var(--text-muted)' }}>
+                              {formatPhilippinePhone(row.customerPhone)}
+                            </small>
+                          )}
+                        </td>
+                        <td>
+                          {row.startDate} &rarr; {row.endDate}
+                        </td>
+                        <td>
+                          {row.itemStatus === 'dispatched' ? (
+                            <span className="in-progress-status-badge">Out with Customer</span>
+                          ) : (
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: 3, alignItems: 'flex-start' }}>
+                              <span className="completed-status-badge">✓ Completed</span>
+                              <small
+                                style={{
+                                  fontSize: 10,
+                                  fontWeight: 700,
+                                  color: row.itemStatus === 'damaged' ? '#b45309' : '#047857',
                                 }}
                               >
-                                Process Return & Inspection
-                              </button>
-                            ) : (
-                              <span style={{ color: '#047857', fontSize: 11, fontWeight: 600 }}>
-                                Inspected & Checked In
-                              </span>
-                            )}
-                          </td>
-                        </tr>
-                      ))}
-                    {orders.flatMap((o) => o.items || []).length === 0 && (
+                                {row.itemStatus === 'damaged'
+                                  ? 'Returned Damaged (In Maintenance)'
+                                  : 'Returned Okay (Available)'}
+                              </small>
+                            </div>
+                          )}
+                        </td>
+                        <td>
+                          {row.itemStatus === 'dispatched' ? (
+                            <button
+                              className="primary-purple-btn"
+                              style={{ padding: '6px 14px', fontSize: 11 }}
+                              onClick={() => {
+                                setReturningItemId(row.itemId);
+                                setReturnCondition('okay');
+                                setDamageNotes('');
+                                setPenaltyFee('');
+                                setReturnPhysicallyReceived(false);
+                              }}
+                            >
+                              Return Equipment
+                            </button>
+                          ) : (
+                            <span style={{ color: '#047857', fontSize: 11, fontWeight: 700 }}>
+                              ✓ Completed
+                            </span>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                    {returnableOrderItems.length === 0 && (
                       <tr>
-                        <td colSpan={5} style={{ textAlign: 'center', padding: 30, color: 'var(--text-muted)' }}>
-                          No equipment currently awaiting return.
+                        <td colSpan={6} style={{ textAlign: 'center', padding: 30, color: 'var(--text-muted)' }}>
+                          No dispatched or returned equipment yet. Dispatch a confirmed order first.
                         </td>
                       </tr>
                     )}
@@ -2267,17 +2652,21 @@ export default function App() {
                   <table className="finset-table">
                     <thead>
                       <tr>
+                        <th>ORDER #</th>
                         <th>EQUIPMENT</th>
                         <th>SERIAL #</th>
                         <th>CUSTOMER</th>
                         <th>RETURN DATE</th>
-                        <th>RETURN HOURS</th>
-                        <th>INSPECTION STATUS</th>
+                        <th>STATUS</th>
+                        <th>RETURN CONDITION</th>
                       </tr>
                     </thead>
                     <tbody>
                       {returnedItems.map((r) => (
                         <tr key={r.itemId}>
+                          <td>
+                            <strong>{r.orderNumber}</strong>
+                          </td>
                           <td>
                             <strong>{r.equipmentName}</strong>
                           </td>
@@ -2286,19 +2675,21 @@ export default function App() {
                           </td>
                           <td>{r.customerName}</td>
                           <td>{r.returnDate}</td>
-                          <td>{r.hours ? `${r.hours} hrs` : 'Logged'}</td>
+                          <td>
+                            <span className="completed-status-badge">✓ Completed</span>
+                          </td>
                           <td>
                             {r.status === 'damaged' ? (
-                              <span className="cancelled-status-badge">Damage Logged</span>
+                              <span className="cancelled-status-badge">Returned as Damaged</span>
                             ) : (
-                              <span className="confirmed-status-badge">Checked In Clean</span>
+                              <span className="confirmed-status-badge">Returned as Okay</span>
                             )}
                           </td>
                         </tr>
                       ))}
                       {returnedItems.length === 0 && (
                         <tr>
-                          <td colSpan={6} style={{ textAlign: 'center', padding: 30, color: 'var(--text-muted)' }}>
+                          <td colSpan={7} style={{ textAlign: 'center', padding: 30, color: 'var(--text-muted)' }}>
                             No returned equipment records found.
                           </td>
                         </tr>
@@ -2437,7 +2828,11 @@ export default function App() {
             <div className="transactions-table-card" style={{ marginTop: 6 }}>
               <div className="table-card-header">
                 <div>
-                  <h3 className="chart-card-title">Maintenance Records</h3>
+                  <h3 className="chart-card-title">Equipment Maintenance &amp; Repairs</h3>
+                  <p style={{ margin: '4px 0 0', fontSize: 12, color: 'var(--text-muted)' }}>
+                    Equipment under maintenance cannot be toggled directly in Inventory. Click Mark as Repaired below
+                    to complete the repair and automatically set the item back to Available in Inventory.
+                  </p>
                 </div>
               </div>
 
@@ -2447,31 +2842,65 @@ export default function App() {
                     <tr>
                       <th>WORK ORDER</th>
                       <th>EQUIPMENT</th>
-                      <th>TYPE</th>
-                      <th>ODOMETER</th>
-                      <th>COST</th>
+                      <th>SERIAL #</th>
+                      <th>ISSUE / NOTES</th>
+                      <th>DATE</th>
                       <th>STATUS</th>
+                      <th>ACTION</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {maintenance.map((m) => (
-                      <tr key={m.id}>
-                        <td>
-                          <strong>{m.work_order_number}</strong>
-                        </td>
-                        <td>{m.equipment?.model_name || 'Equipment'}</td>
-                        <td>{m.maintenance_type}</td>
-                        <td>{m.odometer_hours_at_service} hrs</td>
-                        <td style={{ fontWeight: 800 }}>{formatPHP(m.total_maintenance_cost)}</td>
-                        <td>
-                          <span className="pending-status-badge">{m.maintenance_status}</span>
-                        </td>
-                      </tr>
-                    ))}
-                    {maintenance.length === 0 && (
+                    {maintenanceQueueItems.map((m) => {
+                      const isOpen = m.status === 'pending' || m.status === 'in_progress';
+                      const busyKey = m.maintenanceId || m.equipmentId;
+                      const isUpdating = maintenanceUpdatingId === busyKey;
+                      return (
+                        <tr key={m.key}>
+                          <td>
+                            <strong>{m.workOrderNumber}</strong>
+                          </td>
+                          <td>
+                            <strong>{m.equipmentName}</strong>
+                          </td>
+                          <td>
+                            <code>{m.serialNumber}</code>
+                          </td>
+                          <td style={{ maxWidth: 260, fontSize: 12, color: '#374151' }}>{m.notes}</td>
+                          <td>{m.scheduledDate}</td>
+                          <td>
+                            {isOpen ? (
+                              <span className="pending-status-badge">Under Maintenance</span>
+                            ) : m.status === 'completed' ? (
+                              <span className="confirmed-status-badge">Repaired</span>
+                            ) : (
+                              <span className="cancelled-status-badge">{m.status}</span>
+                            )}
+                          </td>
+                          <td>
+                            {isOpen ? (
+                              <button
+                                className="approve-btn"
+                                style={{ padding: '6px 14px', fontSize: 11 }}
+                                onClick={() =>
+                                  handleMarkMaintenanceFixed(m.equipmentId, m.maintenanceId)
+                                }
+                                disabled={isUpdating}
+                              >
+                                {isUpdating ? 'Updating...' : '✓ Mark as Repaired'}
+                              </button>
+                            ) : (
+                              <span style={{ fontSize: 11, color: '#047857', fontWeight: 700 }}>
+                                ✓ Repaired (Available in Inventory)
+                              </span>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                    {maintenanceQueueItems.length === 0 && (
                       <tr>
-                        <td colSpan={6} style={{ textAlign: 'center', padding: 30, color: 'var(--text-muted)' }}>
-                          No active maintenance work orders.
+                        <td colSpan={7} style={{ textAlign: 'center', padding: 30, color: 'var(--text-muted)' }}>
+                          No equipment is currently under maintenance.
                         </td>
                       </tr>
                     )}
@@ -2617,7 +3046,7 @@ export default function App() {
                     </div>
 
                     <div className="form-group">
-                      <label>Company / Depot</label>
+                      <label>Company / Studio</label>
                       <input
                         type="text"
                         value={profileCompany}
@@ -2750,13 +3179,85 @@ export default function App() {
             }}
           >
             <h2 style={{ fontSize: 22, fontWeight: 800, margin: '0 0 6px', color: '#111827' }}>
-              Confirm Reservation: {rentingEquipment.model_name}
+              {currentRole === 'staff'
+                ? `Rent for Customer: ${rentingEquipment.model_name}`
+                : `Confirm Reservation: ${rentingEquipment.model_name}`}
             </h2>
             <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: '0 0 18px' }}>
               {formatPHP(rentingEquipment.daily_rental_rate)}/day &bull; Value: {formatPHP(rentingEquipment.replacement_value)}
             </p>
 
             <form onSubmit={handleBookingSubmit} className="auth-form-finset">
+              {currentRole === 'staff' && (
+                <>
+                  <div className="form-group">
+                    <label>Select Equipment</label>
+                    <select
+                      className="filter-select-pill"
+                      style={{ width: '100%', borderRadius: 12, padding: 10 }}
+                      value={rentingEquipment.id}
+                      onChange={(e) => {
+                        const chosen = availableEquipment.find((eq) => eq.id === e.target.value);
+                        if (chosen) {
+                          setRentingEquipment(chosen);
+                          const nextOpen = findNextAvailableDate(chosen.id);
+                          if (bookStartDate < todayDate || getEquipmentBlockOnDate(chosen.id, bookStartDate)) {
+                            setBookStartDate(nextOpen);
+                          }
+                        }
+                      }}
+                    >
+                      {availableEquipment.map((eq) => (
+                        <option key={eq.id} value={eq.id}>
+                          {eq.model_name} ({formatPHP(eq.daily_rental_rate)}/day)
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className="form-group">
+                    <label>Select Customer Account</label>
+                    {customerAccounts.length > 0 ? (
+                      <select
+                        className="filter-select-pill"
+                        style={{ width: '100%', borderRadius: 12, padding: 10 }}
+                        value={bookSelectedCustomerId}
+                        onChange={(e) => {
+                          const custId = e.target.value;
+                          setBookSelectedCustomerId(custId);
+                          const cust = customerAccounts.find((c) => c.id === custId);
+                          if (cust) {
+                            setBookCustomerName(cust.full_name);
+                            setBookCustomerPhone(cust.phone);
+                          }
+                        }}
+                        required
+                      >
+                        {customerAccounts.map((cust) => (
+                          <option key={cust.id} value={cust.id}>
+                            {cust.full_name} ({cust.email})
+                          </option>
+                        ))}
+                      </select>
+                    ) : (
+                      <div
+                        role="alert"
+                        style={{
+                          padding: '8px 12px',
+                          borderRadius: 10,
+                          background: 'var(--red-bg)',
+                          color: 'var(--red-kpi)',
+                          fontSize: 11,
+                          fontWeight: 700,
+                        }}
+                      >
+                        No active customer accounts found yet. Ask the customer to create a Customer account first.
+                      </div>
+                    )}
+                  </div>
+                </>
+              )}
+
               <div className="form-row">
                 <div className="form-group">
                   <label>Customer Name</label>
@@ -2787,11 +3288,17 @@ export default function App() {
                     type="date"
                     min={todayDate}
                     value={bookStartDate}
-                    onChange={(e) => setBookStartDate(e.target.value)}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      if (val && val < todayDate) {
+                        showToast(`Past dates are not allowed. Minimum rental start date is ${todayDate}.`);
+                      }
+                      setBookStartDate(val);
+                    }}
                     required
                   />
                   <small style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-                    Today or future dates only
+                    Today ({todayDate}) or future dates only
                   </small>
                 </div>
 
@@ -2810,10 +3317,10 @@ export default function App() {
               </div>
 
               <div className="form-group">
-                <label>Job Site / Delivery Address</label>
+                <label>Shoot Location / Delivery Address</label>
                 <input
                   type="text"
-                  placeholder="e.g. Warehouse 4, Subic Port"
+                  placeholder="e.g. Studio B, Quezon City"
                   value={bookAddress}
                   onChange={(e) => setBookAddress(e.target.value)}
                   required
@@ -2866,7 +3373,23 @@ export default function App() {
                   <span>Total Due</span>
                   <span>{formatPHP(bookingTotal)}</span>
                 </div>
-                {bookingOverlapReason ? (
+                {bookingPastDateError ? (
+                  <div
+                    role="alert"
+                    style={{
+                      marginTop: 10,
+                      padding: '8px 12px',
+                      borderRadius: 10,
+                      background: 'var(--red-bg)',
+                      color: 'var(--red-kpi)',
+                      fontSize: 11,
+                      fontWeight: 700,
+                    }}
+                  >
+                    ⚠️ Invalid Date: Reservations on previous dates are not allowed. Choose {todayDate} or a future
+                    date.
+                  </div>
+                ) : bookingOverlapReason ? (
                   <div
                     role="alert"
                     style={{
@@ -2883,6 +3406,10 @@ export default function App() {
                     {bookStartDate}
                     {bookingEndDate && bookingEndDate !== bookStartDate ? ` to ${bookingEndDate}` : ''}.
                     Please select different dates.
+                  </div>
+                ) : currentRole === 'staff' ? (
+                  <div style={{ marginTop: 8, fontSize: 11, color: '#047857', fontWeight: 700 }}>
+                    ✓ Staff Booking: Order will be Confirmed immediately and ready for Dispatch &amp; Checkout
                   </div>
                 ) : (
                   <div style={{ marginTop: 8, fontSize: 11, color: '#b45309', fontWeight: 600 }}>
@@ -2902,13 +3429,29 @@ export default function App() {
                 <button
                   type="submit"
                   className="primary-purple-btn"
-                  disabled={Boolean(bookingOverlapReason)}
+                  disabled={
+                    bookingPastDateError ||
+                    Boolean(bookingOverlapReason) ||
+                    (currentRole === 'staff' && !bookSelectedCustomerId)
+                  }
                   style={{
-                    opacity: bookingOverlapReason ? 0.5 : 1,
-                    cursor: bookingOverlapReason ? 'not-allowed' : 'pointer',
+                    opacity:
+                      bookingPastDateError ||
+                      Boolean(bookingOverlapReason) ||
+                      (currentRole === 'staff' && !bookSelectedCustomerId)
+                        ? 0.5
+                        : 1,
+                    cursor:
+                      bookingPastDateError ||
+                      Boolean(bookingOverlapReason) ||
+                      (currentRole === 'staff' && !bookSelectedCustomerId)
+                        ? 'not-allowed'
+                        : 'pointer',
                   }}
                 >
-                  Confirm Reservation Request
+                  {currentRole === 'staff'
+                    ? 'Confirm Rental for Customer'
+                    : 'Confirm Reservation Request'}
                 </button>
               </div>
             </form>
@@ -2916,7 +3459,7 @@ export default function App() {
         </div>
       )}
 
-      {/* MODAL 2: RETURN INSPECTION (STAFF MUST CONFIRM PHYSICAL RETURN) */}
+      {/* MODAL 2: RETURN EQUIPMENT CHECK-IN (OKAY -> AVAILABLE | DAMAGED -> UNDER MAINTENANCE) */}
       {returningItemId && (
         <div
           style={{
@@ -2935,17 +3478,26 @@ export default function App() {
               background: '#ffffff',
               borderRadius: 32,
               padding: 34,
-              maxWidth: 500,
+              maxWidth: 520,
               width: '100%',
               boxShadow: '0 25px 70px rgba(0,0,0,0.22)',
             }}
           >
-            <h2 style={{ fontSize: 22, fontWeight: 800, margin: '0 0 6px', color: '#111827' }}>
-              Return Inspection
-            </h2>
-            <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: '0 0 16px' }}>
-              Staff return check-in protocol and physical asset verification.
-            </p>
+            {(() => {
+              const returningRow = returnableOrderItems.find((r) => r.itemId === returningItemId);
+              return (
+                <>
+                  <h2 style={{ fontSize: 22, fontWeight: 800, margin: '0 0 6px', color: '#111827' }}>
+                    Return Equipment Check-In
+                  </h2>
+                  <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: '0 0 16px' }}>
+                    {returningRow
+                      ? `${returningRow.equipmentName} (${returningRow.orderNumber}) — ${returningRow.customerName}`
+                      : 'Verify returned equipment condition.'}
+                  </p>
+                </>
+              );
+            })()}
 
             <form onSubmit={handleReturnSubmit} className="auth-form-finset">
               {/* Mandatory Physical Return Checkbox */}
@@ -2975,68 +3527,80 @@ export default function App() {
                     onChange={(e) => setReturnPhysicallyReceived(e.target.checked)}
                     style={{ width: 18, height: 18, cursor: 'pointer' }}
                   />
-                  <span>I confirm this equipment has been physically returned and received at the depot.</span>
+                  <span>I confirm the customer has physically returned this equipment.</span>
                 </label>
               </div>
 
+              {/* Explicit Return Condition Selector: Okay vs Damaged */}
               <div className="form-group">
-                <label>Observed Return Odometer Hours</label>
-                <input
-                  type="number"
-                  step="0.5"
-                  min="0"
-                  placeholder="e.g. 142.5"
-                  value={returnOdometer}
-                  onChange={(e) => setReturnOdometer(e.target.value)}
-                  required
-                />
-              </div>
+                <label>Return Condition</label>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginTop: 4 }}>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setReturnCondition('okay');
+                      setPenaltyFee('');
+                    }}
+                    style={{
+                      padding: '14px 12px',
+                      borderRadius: 14,
+                      border:
+                        returnCondition === 'okay'
+                          ? '2px solid #059669'
+                          : '1px solid var(--border-subtle)',
+                      background: returnCondition === 'okay' ? '#ecfdf5' : '#ffffff',
+                      color: returnCondition === 'okay' ? '#065f46' : '#374151',
+                      textAlign: 'left',
+                      cursor: 'pointer',
+                    }}
+                  >
+                    <div style={{ fontWeight: 800, fontSize: 13, marginBottom: 4 }}>
+                      ✓ Returned as Okay
+                    </div>
+                    <div style={{ fontSize: 11, opacity: 0.85, lineHeight: 1.35 }}>
+                      Good condition — automatically becomes <strong>Available</strong>
+                    </div>
+                  </button>
 
-              <div className="form-row">
-                <div className="form-group">
-                  <label>Fuel Level (%)</label>
-                  <input
-                    type="number"
-                    min="0"
-                    max="100"
-                    placeholder="100"
-                    value={returnFuel}
-                    onChange={(e) => setReturnFuel(e.target.value)}
-                    required
-                  />
+                  <button
+                    type="button"
+                    onClick={() => setReturnCondition('damaged')}
+                    style={{
+                      padding: '14px 12px',
+                      borderRadius: 14,
+                      border:
+                        returnCondition === 'damaged'
+                          ? '2px solid #dc2626'
+                          : '1px solid var(--border-subtle)',
+                      background: returnCondition === 'damaged' ? '#fef2f2' : '#ffffff',
+                      color: returnCondition === 'damaged' ? '#991b1b' : '#374151',
+                      textAlign: 'left',
+                      cursor: 'pointer',
+                    }}
+                  >
+                    <div style={{ fontWeight: 800, fontSize: 13, marginBottom: 4 }}>
+                      ⚠ Returned as Damaged
+                    </div>
+                    <div style={{ fontSize: 11, opacity: 0.85, lineHeight: 1.35 }}>
+                      Needs repair — automatically set to <strong>Under Maintenance</strong>
+                    </div>
+                  </button>
                 </div>
-                <div className="form-group">
-                  <label>Cleanliness (1-5)</label>
-                  <input
-                    type="number"
-                    min="1"
-                    max="5"
-                    placeholder="5"
-                    value={returnCleanliness}
-                    onChange={(e) => setReturnCleanliness(e.target.value)}
-                    required
-                  />
-                </div>
               </div>
 
               <div className="form-group">
-                <label>Integrity Rating (1-5)</label>
-                <input
-                  type="number"
-                  min="1"
-                  max="5"
-                  placeholder="5"
-                  value={returnIntegrity}
-                  onChange={(e) => setReturnIntegrity(e.target.value)}
-                  required
-                />
-              </div>
-
-              <div className="form-group">
-                <label>Condition / Damage Notes (Optional)</label>
+                <label>
+                  {returnCondition === 'damaged'
+                    ? 'Damage / Issue Description'
+                    : 'Check-In Notes (Optional)'}
+                </label>
                 <textarea
                   rows={2}
-                  placeholder="Note any visible wear, dents, or required maintenance..."
+                  placeholder={
+                    returnCondition === 'damaged'
+                      ? 'e.g. Scratched lens element, missing battery door, gimbal motor issue...'
+                      : 'Optional return notes (e.g. Complete kit with battery & charger)...'
+                  }
                   value={damageNotes}
                   onChange={(e) => setDamageNotes(e.target.value)}
                   style={{
@@ -3049,17 +3613,19 @@ export default function App() {
                 />
               </div>
 
-              <div className="form-group">
-                <label>Penalty Fee (PHP, Optional)</label>
-                <input
-                  type="number"
-                  min="0"
-                  step="0.01"
-                  placeholder="0.00"
-                  value={penaltyFee}
-                  onChange={(e) => setPenaltyFee(e.target.value)}
-                />
-              </div>
+              {returnCondition === 'damaged' && (
+                <div className="form-group">
+                  <label>Damage Penalty Fee (PHP, Optional)</label>
+                  <input
+                    type="number"
+                    min="0"
+                    step="0.01"
+                    placeholder="0.00"
+                    value={penaltyFee}
+                    onChange={(e) => setPenaltyFee(e.target.value)}
+                  />
+                </div>
+              )}
 
               <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, marginTop: 16 }}>
                 <button
@@ -3073,9 +3639,14 @@ export default function App() {
                   type="submit"
                   className="primary-purple-btn"
                   disabled={!returnPhysicallyReceived}
-                  style={{ opacity: returnPhysicallyReceived ? 1 : 0.5 }}
+                  style={{
+                    opacity: returnPhysicallyReceived ? 1 : 0.5,
+                    background: returnCondition === 'damaged' ? '#dc2626' : undefined,
+                  }}
                 >
-                  Complete Return & Inspection
+                  {returnCondition === 'damaged'
+                    ? '⚠ Return as Damaged (Send to Maintenance)'
+                    : '✓ Return as Okay (Set Available)'}
                 </button>
               </div>
             </form>
@@ -3108,10 +3679,10 @@ export default function App() {
             }}
           >
             <h2 style={{ fontSize: 22, fontWeight: 800, margin: '0 0 6px', color: '#111827' }}>
-              Add New Machinery to Fleet
+              Add New Equipment to Catalog
             </h2>
             <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: '0 0 18px' }}>
-              Admin equipment catalog provisioning.
+              Add cameras, lenses, lighting, audio, or studio gear to the rental catalog.
             </p>
 
             <form onSubmit={handleCreateEquipment} className="auth-form-finset">
@@ -3121,17 +3692,17 @@ export default function App() {
                   <input
                     type="text"
                     required
-                    placeholder="e.g. CAT 320D Excavator"
+                    placeholder="e.g. Sony Alpha A7 IV Mirrorless Camera"
                     value={eqModelName}
                     onChange={(e) => setEqModelName(e.target.value)}
                   />
                 </div>
                 <div className="form-group">
-                  <label>Manufacturer</label>
+                  <label>Manufacturer / Brand</label>
                   <input
                     type="text"
                     required
-                    placeholder="e.g. Caterpillar"
+                    placeholder="e.g. Sony, Canon, DJI, Aputure"
                     value={eqManufacturer}
                     onChange={(e) => setEqManufacturer(e.target.value)}
                   />
@@ -3144,7 +3715,7 @@ export default function App() {
                   <input
                     type="text"
                     required
-                    placeholder="e.g. CAT-320D-9982"
+                    placeholder="e.g. CAM-SN-A7IV-02"
                     value={eqSerialNumber}
                     onChange={(e) => setEqSerialNumber(e.target.value)}
                   />
@@ -3169,7 +3740,7 @@ export default function App() {
                     type="number"
                     min="1"
                     step="0.01"
-                    placeholder="e.g. 5000"
+                    placeholder="e.g. 2500"
                     value={eqDailyRate}
                     onChange={(e) => setEqDailyRate(e.target.value)}
                     required
@@ -3181,7 +3752,7 @@ export default function App() {
                     type="number"
                     min="1"
                     step="0.01"
-                    placeholder="e.g. 2500000"
+                    placeholder="e.g. 145000"
                     value={eqReplacementVal}
                     onChange={(e) => setEqReplacementVal(e.target.value)}
                     required
@@ -3206,7 +3777,7 @@ export default function App() {
                   </select>
                 </div>
                 <div className="form-group">
-                  <label>Depot / Warehouse</label>
+                  <label>Pickup Hub / Studio Branch</label>
                   <select
                     className="filter-select-pill"
                     style={{ width: '100%', borderRadius: 12, padding: 10 }}

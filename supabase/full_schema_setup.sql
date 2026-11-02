@@ -300,15 +300,11 @@ AS $$
 BEGIN
     IF (TG_OP = 'INSERT' OR TG_OP = 'UPDATE') THEN
         IF NEW.item_status = 'dispatched' THEN
-            UPDATE public.equipment SET current_status = 'rented' WHERE id = NEW.equipment_id;
+            UPDATE public.equipment SET current_status = 'rented', updated_at = NOW() WHERE id = NEW.equipment_id;
         ELSIF NEW.item_status = 'returned' THEN
-            IF NEW.condition_notes ILIKE '%damage%' OR NEW.condition_notes ILIKE '%repair%' THEN
-                UPDATE public.equipment SET current_status = 'under_maintenance', operational_hours = COALESCE(NEW.return_odometer_hours, operational_hours) WHERE id = NEW.equipment_id;
-            ELSE
-                UPDATE public.equipment SET current_status = 'available', operational_hours = COALESCE(NEW.return_odometer_hours, operational_hours) WHERE id = NEW.equipment_id;
-            END IF;
+            UPDATE public.equipment SET current_status = 'available', operational_hours = COALESCE(NEW.return_odometer_hours, operational_hours), updated_at = NOW() WHERE id = NEW.equipment_id;
         ELSIF NEW.item_status = 'damaged' THEN
-            UPDATE public.equipment SET current_status = 'under_maintenance', operational_hours = COALESCE(NEW.return_odometer_hours, operational_hours) WHERE id = NEW.equipment_id;
+            UPDATE public.equipment SET current_status = 'under_maintenance', operational_hours = COALESCE(NEW.return_odometer_hours, operational_hours), updated_at = NOW() WHERE id = NEW.equipment_id;
         END IF;
     END IF;
     RETURN NEW;
@@ -581,11 +577,11 @@ $$;
 
 CREATE OR REPLACE FUNCTION sp_process_equipment_return(
     p_order_item_id UUID,
-    p_return_odometer NUMERIC,
-    p_fuel_level INT,
-    p_cleanliness INT,
-    p_integrity INT,
-    p_inspector_id UUID,
+    p_return_odometer NUMERIC DEFAULT 0,
+    p_fuel_level INT DEFAULT 100,
+    p_cleanliness INT DEFAULT 5,
+    p_integrity INT DEFAULT 5,
+    p_inspector_id UUID DEFAULT NULL,
     p_damage_notes TEXT DEFAULT NULL,
     p_penalty_fee NUMERIC DEFAULT 0.00
 )
@@ -596,11 +592,13 @@ SET search_path = public, pg_temp
 AS $$
 DECLARE
     v_item RECORD;
+    v_effective_inspector UUID;
     v_inspector_role user_role_type;
     v_has_damage BOOLEAN := FALSE;
     v_new_item_status item_rental_status;
     v_parent_order_id UUID;
     v_remaining_dispatched INT;
+    v_final_hours NUMERIC;
     v_maintenance_created BOOLEAN := FALSE;
     v_maintenance_id UUID := NULL;
     v_result JSONB;
@@ -609,12 +607,13 @@ BEGIN
         RAISE EXCEPTION 'Authorization Error: Current session is not authorized to process returns.';
     END IF;
 
-    SELECT role INTO v_inspector_role FROM public.user_profiles WHERE id = p_inspector_id;
+    v_effective_inspector := COALESCE(p_inspector_id, public.fn_current_profile_id());
+    SELECT role INTO v_inspector_role FROM public.user_profiles WHERE id = v_effective_inspector;
     IF v_inspector_role IS NULL OR v_inspector_role NOT IN ('admin', 'staff') THEN
-        RAISE EXCEPTION 'Authorization Error: Inspector % is not authorized.', p_inspector_id;
+        RAISE EXCEPTION 'Authorization Error: Inspector is not authorized.';
     END IF;
 
-    SELECT roi.*, e.maintenance_interval_hours, e.model_name
+    SELECT roi.*, e.model_name
     INTO v_item
     FROM public.rental_order_items roi
     JOIN public.equipment e ON e.id = roi.equipment_id
@@ -628,12 +627,9 @@ BEGIN
         RAISE EXCEPTION 'Invalid State Transition: Item is in "%" status, cannot be returned.', v_item.item_status;
     END IF;
 
-    IF p_return_odometer < COALESCE(v_item.dispatch_odometer_hours, 0) THEN
-        RAISE EXCEPTION 'Odometer Validation Error: Return hours cannot be less than dispatch hours.';
-    END IF;
-
+    v_final_hours := GREATEST(COALESCE(p_return_odometer, 0), COALESCE(v_item.dispatch_odometer_hours, 0));
     v_parent_order_id := v_item.rental_order_id;
-    v_has_damage := (p_integrity <= 2 OR (p_damage_notes IS NOT NULL AND length(trim(p_damage_notes)) > 0) OR p_penalty_fee > 0);
+    v_has_damage := (COALESCE(p_integrity, 5) <= 2);
     v_new_item_status := CASE WHEN v_has_damage THEN 'damaged'::item_rental_status ELSE 'returned'::item_rental_status END;
 
     INSERT INTO public.equipment_inspections (
@@ -641,32 +637,37 @@ BEGIN
         odometer_reading, cleanliness_rating, structural_integrity_rating,
         damage_identified, damage_assessment_notes, penalty_fee, sign_off_status
     ) VALUES (
-        p_order_item_id, p_inspector_id, 'post_return', p_fuel_level,
-        p_return_odometer, p_cleanliness, p_integrity,
-        v_has_damage, p_damage_notes, COALESCE(p_penalty_fee, 0.00), TRUE
+        p_order_item_id,
+        v_effective_inspector,
+        'post_return',
+        LEAST(GREATEST(COALESCE(p_fuel_level, 100), 0), 100),
+        v_final_hours,
+        LEAST(GREATEST(COALESCE(p_cleanliness, CASE WHEN v_has_damage THEN 2 ELSE 5 END), 1), 5),
+        LEAST(GREATEST(COALESCE(p_integrity, 5), 1), 5),
+        v_has_damage,
+        NULLIF(trim(COALESCE(p_damage_notes, '')), ''),
+        COALESCE(p_penalty_fee, 0.00),
+        TRUE
     );
 
     UPDATE public.rental_order_items
     SET item_status = v_new_item_status,
-        return_odometer_hours = p_return_odometer,
+        return_odometer_hours = v_final_hours,
         returned_at = NOW(),
-        condition_notes = p_damage_notes
+        condition_notes = NULLIF(trim(COALESCE(p_damage_notes, '')), '')
     WHERE id = p_order_item_id;
 
-    IF v_has_damage OR (p_return_odometer >= v_item.maintenance_interval_hours) THEN
+    IF v_has_damage THEN
         INSERT INTO public.maintenance_records (
             work_order_number, equipment_id, maintenance_type, maintenance_status,
             scheduled_date, odometer_hours_at_service, lead_technician_id, service_description
         ) VALUES (
-            'WO-' || to_char(NOW(), 'YYYYMMDD') || '-' || substr(gen_random_uuid()::text, 1, 6),
+            'WO-' || to_char(NOW(), 'YYYYMMDD') || '-' || upper(substr(gen_random_uuid()::text, 1, 6)),
             v_item.equipment_id,
-            CASE WHEN v_has_damage THEN 'emergency_repair'::maintenance_type_enum ELSE 'scheduled_routine'::maintenance_type_enum END,
+            'emergency_repair'::maintenance_type_enum,
             'pending'::maintenance_status_enum,
-            CURRENT_DATE, p_return_odometer, p_inspector_id,
-            CASE WHEN v_has_damage
-                THEN 'Post-return damage repair: ' || COALESCE(p_damage_notes, 'Physical inspection failure')
-                ELSE 'Routine service milestone exceeded (' || p_return_odometer || ' hours logged)'
-            END
+            CURRENT_DATE, v_final_hours, v_effective_inspector,
+            'Returned damaged: ' || COALESCE(NULLIF(trim(p_damage_notes), ''), 'Requires inspection & repair before next rental')
         ) RETURNING id INTO v_maintenance_id;
 
         v_maintenance_created := TRUE;
@@ -688,7 +689,7 @@ BEGIN
         'equipment_id', v_item.equipment_id,
         'item_status', v_new_item_status,
         'damage_flag', v_has_damage,
-        'penalty_fee', p_penalty_fee,
+        'penalty_fee', COALESCE(p_penalty_fee, 0),
         'parent_order_completed', (v_remaining_dispatched = 0),
         'maintenance_work_order_created', v_maintenance_created,
         'maintenance_record_id', v_maintenance_id
@@ -697,6 +698,87 @@ BEGIN
     RETURN v_result;
 END;
 $$;
+
+CREATE OR REPLACE FUNCTION fn_sync_maintenance_completion()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+    v_open_maint_count INT;
+    v_active_dispatch_count INT;
+BEGIN
+    IF NEW.maintenance_status = 'completed' AND (OLD.maintenance_status IS DISTINCT FROM 'completed') THEN
+        SELECT COUNT(*) INTO v_open_maint_count
+        FROM public.maintenance_records
+        WHERE equipment_id = NEW.equipment_id
+          AND id <> NEW.id
+          AND maintenance_status IN ('pending', 'in_progress');
+
+        SELECT COUNT(*) INTO v_active_dispatch_count
+        FROM public.rental_order_items
+        WHERE equipment_id = NEW.equipment_id
+          AND item_status = 'dispatched';
+
+        IF v_open_maint_count = 0 AND v_active_dispatch_count = 0 THEN
+            UPDATE public.equipment
+            SET current_status = 'available',
+                updated_at = NOW()
+            WHERE id = NEW.equipment_id;
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_sync_maintenance_completion
+AFTER UPDATE OF maintenance_status ON maintenance_records
+FOR EACH ROW EXECUTE FUNCTION fn_sync_maintenance_completion();
+
+CREATE OR REPLACE FUNCTION sp_complete_maintenance_repair(p_maintenance_id UUID)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+    v_equip_id UUID;
+BEGIN
+    IF public.fn_current_user_role() NOT IN ('admin', 'staff') THEN
+        RAISE EXCEPTION 'Authorization Error: Only staff or administrators can complete maintenance repairs.';
+    END IF;
+
+    UPDATE public.maintenance_records
+    SET maintenance_status = 'completed',
+        completed_date = CURRENT_DATE,
+        updated_at = NOW()
+    WHERE id = p_maintenance_id
+    RETURNING equipment_id INTO v_equip_id;
+
+    IF v_equip_id IS NULL THEN
+        RAISE EXCEPTION 'Maintenance work order % not found.', p_maintenance_id;
+    END IF;
+
+    UPDATE public.equipment
+    SET current_status = 'available',
+        updated_at = NOW()
+    WHERE id = v_equip_id
+      AND NOT EXISTS (
+          SELECT 1 FROM public.rental_order_items roi
+          WHERE roi.equipment_id = v_equip_id AND roi.item_status = 'dispatched'
+      );
+
+    RETURN jsonb_build_object(
+        'success', true,
+        'maintenance_id', p_maintenance_id,
+        'equipment_id', v_equip_id,
+        'new_equipment_status', 'available'
+    );
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.sp_complete_maintenance_repair(UUID) TO authenticated;
 
 CREATE OR REPLACE FUNCTION fn_get_equipment_booked_ranges()
 RETURNS TABLE (
@@ -742,9 +824,9 @@ CREATE OR REPLACE FUNCTION sp_admin_upsert_staff_profile(
     p_full_name TEXT,
     p_email TEXT,
     p_phone TEXT,
-    p_company_name TEXT DEFAULT 'EquipRent Operations'
+    p_company_name TEXT DEFAULT 'EquipRent Studio Operations'
 )
-RETURNS public.user_profiles
+RETURNS JSONB
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = public, pg_temp
@@ -764,7 +846,7 @@ BEGIN
         trim(p_full_name),
         lower(trim(p_email)),
         trim(p_phone),
-        COALESCE(NULLIF(trim(p_company_name), ''), 'EquipRent Operations'),
+        COALESCE(NULLIF(trim(p_company_name), ''), 'EquipRent Studio Operations'),
         'staff',
         NULL,
         'active'
@@ -780,7 +862,7 @@ BEGIN
         updated_at = NOW()
     RETURNING * INTO v_profile;
 
-    RETURN v_profile;
+    RETURN to_jsonb(v_profile);
 END;
 $$;
 
@@ -792,12 +874,17 @@ SET search_path = public, pg_temp
 AS $$
 DECLARE
     v_target_role public.user_role_type;
+    v_auth_user_id UUID;
 BEGIN
     IF public.fn_current_user_role() <> 'admin' THEN
         RAISE EXCEPTION 'Authorization Error: Only administrators can remove user accounts.';
     END IF;
 
-    SELECT role INTO v_target_role FROM public.user_profiles WHERE id = p_user_id;
+    SELECT role, auth_user_id
+    INTO v_target_role, v_auth_user_id
+    FROM public.user_profiles
+    WHERE id = p_user_id;
+
     IF v_target_role IS NULL THEN
         RAISE EXCEPTION 'User profile not found.';
     END IF;
@@ -806,10 +893,53 @@ BEGIN
         RAISE EXCEPTION 'Action Denied: Administrator accounts cannot be removed.';
     END IF;
 
+    UPDATE public.equipment e
+    SET current_status = 'available',
+        updated_at = NOW()
+    WHERE e.current_status = 'rented'
+      AND EXISTS (
+          SELECT 1
+          FROM public.rental_order_items roi
+          JOIN public.rental_orders ro ON ro.id = roi.rental_order_id
+          WHERE ro.customer_id = p_user_id
+            AND roi.equipment_id = e.id
+            AND roi.item_status = 'dispatched'
+      )
+      AND NOT EXISTS (
+          SELECT 1
+          FROM public.maintenance_records mr
+          WHERE mr.equipment_id = e.id
+            AND mr.maintenance_status IN ('pending', 'in_progress')
+      );
+
+    DELETE FROM public.payment_transactions pt
+    USING public.rental_orders ro
+    WHERE pt.rental_order_id = ro.id
+      AND ro.customer_id = p_user_id;
+
+    DELETE FROM public.equipment_inspections WHERE inspector_id = p_user_id;
+    DELETE FROM public.maintenance_tasks WHERE technician_id = p_user_id;
+
+    UPDATE public.rental_orders SET authorized_staff_id = NULL WHERE authorized_staff_id = p_user_id;
+    UPDATE public.payment_transactions SET processed_by = NULL WHERE processed_by = p_user_id;
+    UPDATE public.maintenance_records SET lead_technician_id = NULL WHERE lead_technician_id = p_user_id;
+    UPDATE public.warehouse_locations SET manager_id = NULL WHERE manager_id = p_user_id;
+
+    DELETE FROM public.rental_order_items roi
+    USING public.rental_orders ro
+    WHERE roi.rental_order_id = ro.id
+      AND ro.customer_id = p_user_id;
+
+    DELETE FROM public.rental_orders WHERE customer_id = p_user_id;
     DELETE FROM public.user_profiles WHERE id = p_user_id;
-EXCEPTION
-    WHEN foreign_key_violation THEN
-        RAISE EXCEPTION 'Cannot remove this user because they have linked rental orders or inspection records.';
+
+    IF v_auth_user_id IS NOT NULL THEN
+        BEGIN
+            DELETE FROM auth.users WHERE id = v_auth_user_id;
+        EXCEPTION WHEN OTHERS THEN
+            NULL;
+        END;
+    END IF;
 END;
 $$;
 
@@ -1036,10 +1166,90 @@ CREATE POLICY pol_anon_equipment_select ON equipment FOR SELECT TO anon USING (t
 CREATE POLICY pol_anon_categories_select ON equipment_categories FOR SELECT TO anon USING (true);
 CREATE POLICY pol_anon_warehouses_select ON warehouse_locations FOR SELECT TO anon USING (true);
 
-REVOKE ALL ON TABLE public.user_profiles FROM anon, authenticated;
-GRANT SELECT ON TABLE public.user_profiles TO authenticated;
-GRANT UPDATE (full_name, phone, company_name, updated_at)
-    ON TABLE public.user_profiles TO authenticated;
+REVOKE ALL ON TABLE public.user_profiles FROM anon;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.user_profiles TO authenticated;
+
+CREATE OR REPLACE FUNCTION public.fn_guard_profile_role_escalation()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+BEGIN
+    IF auth.uid() IS NULL THEN
+        RETURN NEW;
+    END IF;
+
+    IF public.fn_current_user_role() <> 'admin' THEN
+        IF TG_OP = 'INSERT' THEN
+            RAISE EXCEPTION 'Authorization Error: Only administrators can create staff profiles directly.';
+        END IF;
+
+        IF NEW.role IS DISTINCT FROM OLD.role OR NEW.account_status IS DISTINCT FROM OLD.account_status THEN
+            RAISE EXCEPTION 'Authorization Error: Only administrators can modify user roles or account status.';
+        END IF;
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_guard_profile_role_escalation
+    BEFORE INSERT OR UPDATE ON user_profiles
+    FOR EACH ROW EXECUTE FUNCTION public.fn_guard_profile_role_escalation();
+
+CREATE OR REPLACE FUNCTION public.fn_prevent_past_rental_dates()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+    v_today_ph DATE := (NOW() AT TIME ZONE 'Asia/Manila')::date;
+BEGIN
+    IF NEW.expected_start_date < v_today_ph THEN
+        RAISE EXCEPTION 'Invalid Rental Date: Start date (%) cannot be in the past. Choose % or a future date.',
+            NEW.expected_start_date, v_today_ph;
+    END IF;
+
+    IF NEW.expected_end_date < NEW.expected_start_date THEN
+        RAISE EXCEPTION 'Invalid Rental Date: End date (%) cannot be earlier than start date (%).',
+            NEW.expected_end_date, NEW.expected_start_date;
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_prevent_past_rental_dates
+    BEFORE INSERT ON rental_orders
+    FOR EACH ROW EXECUTE FUNCTION public.fn_prevent_past_rental_dates();
+
+CREATE OR REPLACE FUNCTION public.fn_guard_equipment_maintenance_release()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+BEGIN
+    IF OLD.current_status = 'under_maintenance' AND NEW.current_status = 'available' THEN
+        IF EXISTS (
+            SELECT 1
+            FROM public.maintenance_records mr
+            WHERE mr.equipment_id = NEW.id
+              AND mr.maintenance_status IN ('pending', 'in_progress')
+        ) THEN
+            RAISE EXCEPTION 'Maintenance Lock: Equipment has an active repair in Maintenance Queue. Mark it as Repaired in Maintenance Queue first.';
+        END IF;
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_guard_equipment_maintenance_release
+    BEFORE UPDATE OF current_status ON equipment
+    FOR EACH ROW EXECUTE FUNCTION public.fn_guard_equipment_maintenance_release();
 
 CREATE POLICY pol_profiles_auth_select ON user_profiles
     FOR SELECT TO authenticated
@@ -1053,6 +1263,11 @@ CREATE POLICY pol_profiles_self_update ON user_profiles
     FOR UPDATE TO authenticated
     USING (auth_user_id = auth.uid() OR id = auth.uid())
     WITH CHECK (auth_user_id = auth.uid() OR id = auth.uid());
+
+CREATE POLICY pol_profiles_admin_all ON user_profiles
+    FOR ALL TO authenticated
+    USING (fn_current_user_role() = 'admin')
+    WITH CHECK (fn_current_user_role() = 'admin');
 
 -- Trigger to automatically synchronize new Supabase Auth users to user_profiles
 CREATE OR REPLACE FUNCTION public.handle_new_auth_user()

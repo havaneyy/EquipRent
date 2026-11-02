@@ -166,10 +166,10 @@ export function AuthScreen({ onAuthenticated }: AuthScreenProps) {
                   />
                 </div>
                 <div className="form-group">
-                  <label>Company (Optional)</label>
+                  <label>Company / Studio (Optional)</label>
                   <input
                     type="text"
-                    placeholder="Construction / Contracting Co."
+                    placeholder="Studio / Production Co."
                     value={companyName}
                     onChange={(e) => setCompanyName(e.target.value)}
                   />
