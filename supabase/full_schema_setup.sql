@@ -292,29 +292,37 @@ CREATE TRIGGER trg_audit_maintenance_records AFTER INSERT OR UPDATE OR DELETE ON
 CREATE TRIGGER trg_audit_payment_transactions AFTER INSERT OR UPDATE OR DELETE ON payment_transactions FOR EACH ROW EXECUTE FUNCTION fn_universal_audit_logger();
 
 CREATE OR REPLACE FUNCTION fn_sync_equipment_rental_status()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
 BEGIN
     IF (TG_OP = 'INSERT' OR TG_OP = 'UPDATE') THEN
         IF NEW.item_status = 'dispatched' THEN
-            UPDATE equipment SET current_status = 'rented' WHERE id = NEW.equipment_id;
+            UPDATE public.equipment SET current_status = 'rented' WHERE id = NEW.equipment_id;
         ELSIF NEW.item_status = 'returned' THEN
             IF NEW.condition_notes ILIKE '%damage%' OR NEW.condition_notes ILIKE '%repair%' THEN
-                UPDATE equipment SET current_status = 'under_maintenance', operational_hours = COALESCE(NEW.return_odometer_hours, operational_hours) WHERE id = NEW.equipment_id;
+                UPDATE public.equipment SET current_status = 'under_maintenance', operational_hours = COALESCE(NEW.return_odometer_hours, operational_hours) WHERE id = NEW.equipment_id;
             ELSE
-                UPDATE equipment SET current_status = 'available', operational_hours = COALESCE(NEW.return_odometer_hours, operational_hours) WHERE id = NEW.equipment_id;
+                UPDATE public.equipment SET current_status = 'available', operational_hours = COALESCE(NEW.return_odometer_hours, operational_hours) WHERE id = NEW.equipment_id;
             END IF;
         ELSIF NEW.item_status = 'damaged' THEN
-            UPDATE equipment SET current_status = 'under_maintenance', operational_hours = COALESCE(NEW.return_odometer_hours, operational_hours) WHERE id = NEW.equipment_id;
+            UPDATE public.equipment SET current_status = 'under_maintenance', operational_hours = COALESCE(NEW.return_odometer_hours, operational_hours) WHERE id = NEW.equipment_id;
         END IF;
     END IF;
     RETURN NEW;
 END;
-$$ LANGUAGE plpgsql;
+$$;
 
 CREATE TRIGGER trg_sync_equipment_status AFTER INSERT OR UPDATE OF item_status, return_odometer_hours ON rental_order_items FOR EACH ROW EXECUTE FUNCTION fn_sync_equipment_rental_status();
 
 CREATE OR REPLACE FUNCTION fn_recalculate_order_financials()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
 DECLARE
     v_order_id UUID;
     v_new_subtotal NUMERIC(12, 2) := 0.00;
@@ -328,17 +336,15 @@ BEGIN
         v_order_id := NEW.rental_order_id;
     END IF;
 
-    SELECT COALESCE(SUM(item_subtotal), 0.00) INTO v_new_subtotal
-    FROM rental_order_items
-    WHERE rental_order_id = v_order_id;
-
-    SELECT COALESCE(SUM(daily_insurance_rate * days_rented), 0.00) INTO v_new_insurance
-    FROM rental_order_items
+    SELECT COALESCE(SUM(item_subtotal), 0.00),
+           COALESCE(SUM(daily_insurance_rate * days_rented), 0.00)
+    INTO v_new_subtotal, v_new_insurance
+    FROM public.rental_order_items
     WHERE rental_order_id = v_order_id;
 
     v_new_tax := ROUND((v_new_subtotal + v_new_insurance) * v_tax_rate, 2);
 
-    UPDATE rental_orders
+    UPDATE public.rental_orders
     SET subtotal_amount = v_new_subtotal,
         insurance_amount = v_new_insurance,
         tax_amount = v_new_tax,
@@ -348,53 +354,161 @@ BEGIN
 
     RETURN NULL;
 END;
-$$ LANGUAGE plpgsql;
+$$;
 
 CREATE TRIGGER trg_recalc_order_financials AFTER INSERT OR UPDATE OF item_subtotal, unit_daily_rate, daily_insurance_rate, days_rented OR DELETE ON rental_order_items FOR EACH ROW EXECUTE FUNCTION fn_recalculate_order_financials();
 
 CREATE OR REPLACE FUNCTION fn_guard_prevent_double_booking()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
 DECLARE
     v_order_start DATE;
     v_order_end DATE;
+    v_order_status public.rental_order_status;
     v_collision_count INT;
-    v_equip_status equipment_status_type;
+    v_maint_collision_count INT;
+    v_equip_status public.equipment_status_type;
 BEGIN
-    SELECT current_status INTO v_equip_status FROM equipment WHERE id = NEW.equipment_id;
+    SELECT current_status INTO v_equip_status
+    FROM public.equipment
+    WHERE id = NEW.equipment_id
+    FOR UPDATE;
+
     IF v_equip_status = 'decommissioned' THEN
         RAISE EXCEPTION 'Database Integrity Error: Equipment % is decommissioned and cannot be rented.', NEW.equipment_id;
     END IF;
 
-    SELECT expected_start_date, expected_end_date INTO v_order_start, v_order_end
-    FROM rental_orders WHERE id = NEW.rental_order_id;
+    IF NEW.item_status NOT IN ('reserved', 'dispatched') THEN
+        RETURN NEW;
+    END IF;
+
+    SELECT expected_start_date, expected_end_date, status
+    INTO v_order_start, v_order_end, v_order_status
+    FROM public.rental_orders
+    WHERE id = NEW.rental_order_id;
+
+    IF v_order_status IN ('cancelled', 'completed') THEN
+        RETURN NEW;
+    END IF;
 
     SELECT COUNT(*) INTO v_collision_count
-    FROM rental_order_items roi
-    JOIN rental_orders ro ON ro.id = roi.rental_order_id
+    FROM public.rental_order_items roi
+    JOIN public.rental_orders ro ON ro.id = roi.rental_order_id
     WHERE roi.equipment_id = NEW.equipment_id
       AND roi.id <> COALESCE(NEW.id, '00000000-0000-0000-0000-000000000000'::UUID)
       AND roi.item_status IN ('reserved', 'dispatched')
-      AND ro.status IN ('confirmed', 'in_progress')
+      AND ro.status IN ('draft', 'confirmed', 'in_progress')
       AND ((ro.expected_start_date <= v_order_end) AND (ro.expected_end_date >= v_order_start));
 
     IF v_collision_count > 0 THEN
-        RAISE EXCEPTION 'Double-Booking Violation: Equipment unit % is already booked for overlapping date range.', NEW.equipment_id;
+        RAISE EXCEPTION 'Double-Booking Violation: This equipment is already reserved or rented for overlapping dates (% to %).',
+            v_order_start, v_order_end;
+    END IF;
+
+    SELECT COUNT(*) INTO v_maint_collision_count
+    FROM public.maintenance_records mr
+    WHERE mr.equipment_id = NEW.equipment_id
+      AND mr.maintenance_status IN ('pending', 'in_progress')
+      AND mr.scheduled_date BETWEEN v_order_start AND v_order_end;
+
+    IF v_maint_collision_count > 0 THEN
+        RAISE EXCEPTION 'Maintenance Conflict: This equipment has scheduled maintenance during (% to %).',
+            v_order_start, v_order_end;
     END IF;
 
     RETURN NEW;
 END;
-$$ LANGUAGE plpgsql;
+$$;
 
 CREATE TRIGGER trg_guard_double_booking BEFORE INSERT OR UPDATE OF equipment_id, rental_order_id, item_status ON rental_order_items FOR EACH ROW EXECUTE FUNCTION fn_guard_prevent_double_booking();
+
+CREATE OR REPLACE FUNCTION fn_guard_order_update_overlap()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+    v_collision_count INT;
+BEGIN
+    IF NEW.status IN ('draft', 'confirmed', 'in_progress') THEN
+        SELECT COUNT(*) INTO v_collision_count
+        FROM public.rental_order_items my_item
+        JOIN public.rental_order_items other_item
+          ON other_item.equipment_id = my_item.equipment_id
+         AND other_item.rental_order_id <> NEW.id
+        JOIN public.rental_orders other_order
+          ON other_order.id = other_item.rental_order_id
+        WHERE my_item.rental_order_id = NEW.id
+          AND my_item.item_status IN ('reserved', 'dispatched')
+          AND other_item.item_status IN ('reserved', 'dispatched')
+          AND other_order.status IN ('draft', 'confirmed', 'in_progress')
+          AND ((other_order.expected_start_date <= NEW.expected_end_date)
+               AND (other_order.expected_end_date >= NEW.expected_start_date));
+
+        IF v_collision_count > 0 THEN
+            RAISE EXCEPTION 'Double-Booking Violation: Another active or pending reservation already covers (% to %).',
+                NEW.expected_start_date, NEW.expected_end_date;
+        END IF;
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_guard_order_update_overlap BEFORE UPDATE OF status, expected_start_date, expected_end_date ON rental_orders FOR EACH ROW EXECUTE FUNCTION fn_guard_order_update_overlap();
 
 -- ----------------------------------------------------------------------------
 -- STEP 4: STORED PROCEDURES & FUNCTIONS
 -- ----------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION fn_current_profile_id()
+RETURNS UUID
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+    v_profile_id UUID;
+BEGIN
+    SELECT id INTO v_profile_id
+    FROM public.user_profiles
+    WHERE auth_user_id = auth.uid() OR id = auth.uid()
+    LIMIT 1;
+    RETURN v_profile_id;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION fn_current_user_role()
+RETURNS user_role_type
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+    v_role user_role_type;
+BEGIN
+    SELECT role INTO v_role
+    FROM public.user_profiles
+    WHERE auth_user_id = auth.uid() OR id = auth.uid()
+    LIMIT 1;
+    RETURN COALESCE(v_role, 'customer'::user_role_type);
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION sp_process_rental_checkout(
     p_order_id UUID,
     p_staff_id UUID
 )
-RETURNS JSONB AS $$
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
 DECLARE
     v_order_status rental_order_status;
     v_staff_role user_role_type;
@@ -403,12 +517,16 @@ DECLARE
     v_dispatched_items_count INT := 0;
     v_result JSONB;
 BEGIN
-    SELECT role INTO v_staff_role FROM user_profiles WHERE id = p_staff_id;
+    IF public.fn_current_user_role() NOT IN ('admin', 'staff') THEN
+        RAISE EXCEPTION 'Authorization Error: Current session is not authorized to dispatch equipment.';
+    END IF;
+
+    SELECT role INTO v_staff_role FROM public.user_profiles WHERE id = p_staff_id;
     IF v_staff_role IS NULL OR v_staff_role NOT IN ('admin', 'staff') THEN
         RAISE EXCEPTION 'Authorization Error: User % is not authorized to dispatch equipment.', p_staff_id;
     END IF;
 
-    SELECT status INTO v_order_status FROM rental_orders WHERE id = p_order_id;
+    SELECT status INTO v_order_status FROM public.rental_orders WHERE id = p_order_id;
     IF v_order_status IS NULL THEN
         RAISE EXCEPTION 'Entity Not Found: Order % does not exist.', p_order_id;
     END IF;
@@ -418,8 +536,8 @@ BEGIN
     END IF;
 
     SELECT COUNT(*) INTO v_unavailable_item_count
-    FROM rental_order_items roi
-    JOIN equipment e ON e.id = roi.equipment_id
+    FROM public.rental_order_items roi
+    JOIN public.equipment e ON e.id = roi.equipment_id
     WHERE roi.rental_order_id = p_order_id
       AND e.current_status <> 'available';
 
@@ -429,11 +547,11 @@ BEGIN
 
     FOR v_item IN
         SELECT roi.id AS item_id, roi.equipment_id, e.operational_hours
-        FROM rental_order_items roi
-        JOIN equipment e ON e.id = roi.equipment_id
+        FROM public.rental_order_items roi
+        JOIN public.equipment e ON e.id = roi.equipment_id
         WHERE roi.rental_order_id = p_order_id
     LOOP
-        UPDATE rental_order_items
+        UPDATE public.rental_order_items
         SET item_status = 'dispatched',
             dispatch_odometer_hours = v_item.operational_hours,
             dispatched_at = NOW()
@@ -442,7 +560,7 @@ BEGIN
         v_dispatched_items_count := v_dispatched_items_count + 1;
     END LOOP;
 
-    UPDATE rental_orders
+    UPDATE public.rental_orders
     SET status = 'in_progress',
         authorized_staff_id = p_staff_id,
         updated_at = NOW()
@@ -459,7 +577,7 @@ BEGIN
 
     RETURN v_result;
 END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
+$$;
 
 CREATE OR REPLACE FUNCTION sp_process_equipment_return(
     p_order_item_id UUID,
@@ -471,7 +589,11 @@ CREATE OR REPLACE FUNCTION sp_process_equipment_return(
     p_damage_notes TEXT DEFAULT NULL,
     p_penalty_fee NUMERIC DEFAULT 0.00
 )
-RETURNS JSONB AS $$
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
 DECLARE
     v_item RECORD;
     v_inspector_role user_role_type;
@@ -483,15 +605,19 @@ DECLARE
     v_maintenance_id UUID := NULL;
     v_result JSONB;
 BEGIN
-    SELECT role INTO v_inspector_role FROM user_profiles WHERE id = p_inspector_id;
+    IF public.fn_current_user_role() NOT IN ('admin', 'staff') THEN
+        RAISE EXCEPTION 'Authorization Error: Current session is not authorized to process returns.';
+    END IF;
+
+    SELECT role INTO v_inspector_role FROM public.user_profiles WHERE id = p_inspector_id;
     IF v_inspector_role IS NULL OR v_inspector_role NOT IN ('admin', 'staff') THEN
         RAISE EXCEPTION 'Authorization Error: Inspector % is not authorized.', p_inspector_id;
     END IF;
 
     SELECT roi.*, e.maintenance_interval_hours, e.model_name
     INTO v_item
-    FROM rental_order_items roi
-    JOIN equipment e ON e.id = roi.equipment_id
+    FROM public.rental_order_items roi
+    JOIN public.equipment e ON e.id = roi.equipment_id
     WHERE roi.id = p_order_item_id;
 
     IF v_item.id IS NULL THEN
@@ -510,7 +636,7 @@ BEGIN
     v_has_damage := (p_integrity <= 2 OR (p_damage_notes IS NOT NULL AND length(trim(p_damage_notes)) > 0) OR p_penalty_fee > 0);
     v_new_item_status := CASE WHEN v_has_damage THEN 'damaged'::item_rental_status ELSE 'returned'::item_rental_status END;
 
-    INSERT INTO equipment_inspections (
+    INSERT INTO public.equipment_inspections (
         rental_order_item_id, inspector_id, inspection_type, fuel_level_percent,
         odometer_reading, cleanliness_rating, structural_integrity_rating,
         damage_identified, damage_assessment_notes, penalty_fee, sign_off_status
@@ -520,7 +646,7 @@ BEGIN
         v_has_damage, p_damage_notes, COALESCE(p_penalty_fee, 0.00), TRUE
     );
 
-    UPDATE rental_order_items
+    UPDATE public.rental_order_items
     SET item_status = v_new_item_status,
         return_odometer_hours = p_return_odometer,
         returned_at = NOW(),
@@ -528,7 +654,7 @@ BEGIN
     WHERE id = p_order_item_id;
 
     IF v_has_damage OR (p_return_odometer >= v_item.maintenance_interval_hours) THEN
-        INSERT INTO maintenance_records (
+        INSERT INTO public.maintenance_records (
             work_order_number, equipment_id, maintenance_type, maintenance_status,
             scheduled_date, odometer_hours_at_service, lead_technician_id, service_description
         ) VALUES (
@@ -547,11 +673,11 @@ BEGIN
     END IF;
 
     SELECT COUNT(*) INTO v_remaining_dispatched
-    FROM rental_order_items
+    FROM public.rental_order_items
     WHERE rental_order_id = v_parent_order_id AND item_status = 'dispatched';
 
     IF v_remaining_dispatched = 0 THEN
-        UPDATE rental_orders
+        UPDATE public.rental_orders
         SET status = 'completed', actual_return_date = CURRENT_DATE, updated_at = NOW()
         WHERE id = v_parent_order_id;
     END IF;
@@ -570,7 +696,125 @@ BEGIN
 
     RETURN v_result;
 END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
+$$;
+
+CREATE OR REPLACE FUNCTION fn_get_equipment_booked_ranges()
+RETURNS TABLE (
+    equipment_id UUID,
+    start_date DATE,
+    end_date DATE,
+    block_type TEXT
+)
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+BEGIN
+    RETURN QUERY
+    SELECT
+        roi.equipment_id,
+        ro.expected_start_date AS start_date,
+        ro.expected_end_date AS end_date,
+        CASE
+            WHEN ro.status = 'in_progress' OR roi.item_status = 'dispatched' THEN 'rented'::TEXT
+            ELSE 'reserved'::TEXT
+        END AS block_type
+    FROM public.rental_order_items roi
+    JOIN public.rental_orders ro ON ro.id = roi.rental_order_id
+    WHERE ro.status IN ('draft', 'confirmed', 'in_progress')
+      AND roi.item_status IN ('reserved', 'dispatched')
+    UNION ALL
+    SELECT
+        mr.equipment_id,
+        mr.scheduled_date AS start_date,
+        COALESCE(mr.completed_date, mr.scheduled_date) AS end_date,
+        'maintenance'::TEXT AS block_type
+    FROM public.maintenance_records mr
+    WHERE mr.maintenance_status IN ('pending', 'in_progress');
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.fn_get_equipment_booked_ranges() TO authenticated;
+
+CREATE OR REPLACE FUNCTION sp_admin_upsert_staff_profile(
+    p_auth_user_id UUID,
+    p_full_name TEXT,
+    p_email TEXT,
+    p_phone TEXT,
+    p_company_name TEXT DEFAULT 'EquipRent Operations'
+)
+RETURNS public.user_profiles
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+    v_profile public.user_profiles;
+BEGIN
+    IF public.fn_current_user_role() <> 'admin' THEN
+        RAISE EXCEPTION 'Authorization Error: Only administrators can add or promote staff members.';
+    END IF;
+
+    INSERT INTO public.user_profiles (
+        id, auth_user_id, full_name, email, phone, company_name, role, requested_role, account_status
+    ) VALUES (
+        COALESCE(p_auth_user_id, gen_random_uuid()),
+        p_auth_user_id,
+        trim(p_full_name),
+        lower(trim(p_email)),
+        trim(p_phone),
+        COALESCE(NULLIF(trim(p_company_name), ''), 'EquipRent Operations'),
+        'staff',
+        NULL,
+        'active'
+    )
+    ON CONFLICT (email) DO UPDATE
+    SET auth_user_id = COALESCE(EXCLUDED.auth_user_id, public.user_profiles.auth_user_id),
+        full_name = EXCLUDED.full_name,
+        phone = EXCLUDED.phone,
+        company_name = EXCLUDED.company_name,
+        role = 'staff',
+        requested_role = NULL,
+        account_status = 'active',
+        updated_at = NOW()
+    RETURNING * INTO v_profile;
+
+    RETURN v_profile;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION sp_admin_delete_user_profile(p_user_id UUID)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+    v_target_role public.user_role_type;
+BEGIN
+    IF public.fn_current_user_role() <> 'admin' THEN
+        RAISE EXCEPTION 'Authorization Error: Only administrators can remove user accounts.';
+    END IF;
+
+    SELECT role INTO v_target_role FROM public.user_profiles WHERE id = p_user_id;
+    IF v_target_role IS NULL THEN
+        RAISE EXCEPTION 'User profile not found.';
+    END IF;
+
+    IF v_target_role = 'admin' THEN
+        RAISE EXCEPTION 'Action Denied: Administrator accounts cannot be removed.';
+    END IF;
+
+    DELETE FROM public.user_profiles WHERE id = p_user_id;
+EXCEPTION
+    WHEN foreign_key_violation THEN
+        RAISE EXCEPTION 'Cannot remove this user because they have linked rental orders or inspection records.';
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.sp_admin_upsert_staff_profile(UUID, TEXT, TEXT, TEXT, TEXT) TO authenticated;
+GRANT EXECUTE ON FUNCTION public.sp_admin_delete_user_profile(UUID) TO authenticated;
 
 CREATE OR REPLACE FUNCTION fn_get_fleet_utilization_analytics()
 RETURNS TABLE (
@@ -606,7 +850,7 @@ $$ LANGUAGE plpgsql STABLE;
 -- ----------------------------------------------------------------------------
 -- STEP 5: VIEWS & ROW LEVEL SECURITY (RLS)
 -- ----------------------------------------------------------------------------
-CREATE OR REPLACE VIEW vw_equipment_catalog AS
+CREATE OR REPLACE VIEW vw_equipment_catalog WITH (security_invoker = true) AS
 SELECT
     e.id AS equipment_id,
     e.model_name,
@@ -626,7 +870,7 @@ JOIN equipment_categories ec ON ec.id = e.category_id
 JOIN warehouse_locations wl ON wl.id = e.warehouse_id
 WHERE e.current_status <> 'decommissioned';
 
-CREATE OR REPLACE VIEW vw_active_rentals_dashboard AS
+CREATE OR REPLACE VIEW vw_active_rentals_dashboard WITH (security_invoker = true) AS
 SELECT
     ro.id AS order_id,
     ro.order_number,
@@ -649,7 +893,7 @@ LEFT JOIN user_profiles s ON s.id = ro.authorized_staff_id
 LEFT JOIN rental_order_items roi ON roi.rental_order_id = ro.id
 GROUP BY ro.id, c.id, s.id;
 
-CREATE OR REPLACE VIEW vw_maintenance_schedule_overview AS
+CREATE OR REPLACE VIEW vw_maintenance_schedule_overview WITH (security_invoker = true) AS
 SELECT
     mr.id AS maintenance_id,
     mr.work_order_number,
@@ -670,18 +914,6 @@ LEFT JOIN user_profiles tech ON tech.id = mr.lead_technician_id
 LEFT JOIN maintenance_tasks mt ON mt.maintenance_id = mr.id
 GROUP BY mr.id, e.id, tech.id;
 
-CREATE OR REPLACE FUNCTION fn_current_user_role()
-RETURNS user_role_type AS $$
-DECLARE
-    v_role user_role_type;
-BEGIN
-    SELECT role INTO v_role
-    FROM user_profiles
-    WHERE auth_user_id = auth.uid() OR id = auth.uid();
-    RETURN COALESCE(v_role, 'customer'::user_role_type);
-END;
-$$ LANGUAGE plpgsql STABLE SECURITY DEFINER;
-
 ALTER TABLE user_profiles ENABLE ROW LEVEL SECURITY;
 ALTER TABLE warehouse_locations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE equipment_categories ENABLE ROW LEVEL SECURITY;
@@ -694,15 +926,107 @@ ALTER TABLE maintenance_tasks ENABLE ROW LEVEL SECURITY;
 ALTER TABLE equipment_inspections ENABLE ROW LEVEL SECURITY;
 ALTER TABLE audit_logs ENABLE ROW LEVEL SECURITY;
 
+GRANT SELECT ON public.equipment_categories, public.warehouse_locations, public.equipment TO anon, authenticated;
+GRANT INSERT, UPDATE, DELETE ON public.equipment, public.equipment_categories, public.warehouse_locations TO authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.rental_orders, public.rental_order_items TO authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.payment_transactions, public.maintenance_records, public.maintenance_tasks, public.equipment_inspections TO authenticated;
+GRANT SELECT ON public.audit_logs TO authenticated;
+
 CREATE POLICY pol_categories_read ON equipment_categories FOR SELECT USING (true);
 CREATE POLICY pol_equipment_read ON equipment FOR SELECT USING (true);
 CREATE POLICY pol_warehouses_read ON warehouse_locations FOR SELECT USING (true);
+CREATE POLICY pol_categories_admin_all ON equipment_categories FOR ALL TO authenticated USING (fn_current_user_role() = 'admin') WITH CHECK (fn_current_user_role() = 'admin');
+CREATE POLICY pol_warehouses_admin_all ON warehouse_locations FOR ALL TO authenticated USING (fn_current_user_role() = 'admin') WITH CHECK (fn_current_user_role() = 'admin');
 CREATE POLICY pol_equipment_staff_modify ON equipment FOR ALL TO authenticated USING (fn_current_user_role() IN ('admin', 'staff')) WITH CHECK (fn_current_user_role() IN ('admin', 'staff'));
-CREATE POLICY pol_orders_customer_select ON rental_orders FOR SELECT TO authenticated USING (customer_id = auth.uid() OR auth.uid() IN (SELECT id FROM user_profiles WHERE auth_user_id = auth.uid()) OR fn_current_user_role() IN ('admin', 'staff'));
-CREATE POLICY pol_orders_customer_insert ON rental_orders FOR INSERT TO authenticated WITH CHECK (customer_id = auth.uid() OR auth.uid() IN (SELECT id FROM user_profiles WHERE auth_user_id = auth.uid()) OR fn_current_user_role() IN ('admin', 'staff'));
-CREATE POLICY pol_orders_staff_update ON rental_orders FOR UPDATE TO authenticated USING (fn_current_user_role() IN ('admin', 'staff')) WITH CHECK (fn_current_user_role() IN ('admin', 'staff'));
-CREATE POLICY pol_order_items_select ON rental_order_items FOR SELECT TO authenticated USING (EXISTS (SELECT 1 FROM rental_orders ro WHERE ro.id = rental_order_items.rental_order_id AND (ro.customer_id = auth.uid() OR fn_current_user_role() IN ('admin', 'staff'))));
-CREATE POLICY pol_order_items_staff_all ON rental_order_items FOR ALL TO authenticated USING (fn_current_user_role() IN ('admin', 'staff')) WITH CHECK (fn_current_user_role() IN ('admin', 'staff'));
+
+-- Rental Orders RLS (Strict per-customer isolation; no cross-customer access)
+CREATE POLICY pol_orders_customer_select ON rental_orders
+    FOR SELECT TO authenticated
+    USING (
+        customer_id = fn_current_profile_id()
+        OR fn_current_user_role() IN ('admin', 'staff')
+    );
+
+CREATE POLICY pol_orders_customer_insert ON rental_orders
+    FOR INSERT TO authenticated
+    WITH CHECK (
+        (customer_id = fn_current_profile_id() AND status = 'draft')
+        OR fn_current_user_role() IN ('admin', 'staff')
+    );
+
+CREATE POLICY pol_orders_customer_cancel ON rental_orders
+    FOR UPDATE TO authenticated
+    USING (
+        customer_id = fn_current_profile_id()
+        AND status = 'draft'
+    )
+    WITH CHECK (
+        customer_id = fn_current_profile_id()
+        AND status = 'cancelled'
+    );
+
+CREATE POLICY pol_orders_customer_delete_draft ON rental_orders
+    FOR DELETE TO authenticated
+    USING (
+        customer_id = fn_current_profile_id()
+        AND status = 'draft'
+    );
+
+CREATE POLICY pol_orders_staff_update ON rental_orders
+    FOR UPDATE TO authenticated
+    USING (fn_current_user_role() IN ('admin', 'staff'))
+    WITH CHECK (fn_current_user_role() IN ('admin', 'staff'));
+
+-- Rental Order Items RLS (Customers can read and insert items ONLY for their own draft orders)
+CREATE POLICY pol_order_items_select ON rental_order_items
+    FOR SELECT TO authenticated
+    USING (
+        EXISTS (
+            SELECT 1 FROM rental_orders ro
+            WHERE ro.id = rental_order_items.rental_order_id
+              AND (
+                  ro.customer_id = fn_current_profile_id()
+                  OR fn_current_user_role() IN ('admin', 'staff')
+              )
+        )
+    );
+
+CREATE POLICY pol_order_items_customer_insert ON rental_order_items
+    FOR INSERT TO authenticated
+    WITH CHECK (
+        item_status = 'reserved'
+        AND EXISTS (
+            SELECT 1 FROM rental_orders ro
+            WHERE ro.id = rental_order_items.rental_order_id
+              AND ro.customer_id = fn_current_profile_id()
+              AND ro.status = 'draft'
+        )
+    );
+
+CREATE POLICY pol_order_items_staff_all ON rental_order_items
+    FOR ALL TO authenticated
+    USING (fn_current_user_role() IN ('admin', 'staff'))
+    WITH CHECK (fn_current_user_role() IN ('admin', 'staff'));
+
+-- Payment Transactions RLS
+CREATE POLICY pol_payments_select ON payment_transactions
+    FOR SELECT TO authenticated
+    USING (
+        EXISTS (
+            SELECT 1 FROM rental_orders ro
+            WHERE ro.id = payment_transactions.rental_order_id
+              AND (
+                  ro.customer_id = fn_current_profile_id()
+                  OR fn_current_user_role() IN ('admin', 'staff')
+              )
+        )
+    );
+
+CREATE POLICY pol_payments_staff_all ON payment_transactions
+    FOR ALL TO authenticated
+    USING (fn_current_user_role() IN ('admin', 'staff'))
+    WITH CHECK (fn_current_user_role() IN ('admin', 'staff'));
+
 CREATE POLICY pol_maintenance_staff ON maintenance_records FOR ALL TO authenticated USING (fn_current_user_role() IN ('admin', 'staff')) WITH CHECK (fn_current_user_role() IN ('admin', 'staff'));
 CREATE POLICY pol_tasks_staff ON maintenance_tasks FOR ALL TO authenticated USING (fn_current_user_role() IN ('admin', 'staff')) WITH CHECK (fn_current_user_role() IN ('admin', 'staff'));
 CREATE POLICY pol_inspections_staff ON equipment_inspections FOR ALL TO authenticated USING (fn_current_user_role() IN ('admin', 'staff')) WITH CHECK (fn_current_user_role() IN ('admin', 'staff'));
@@ -711,15 +1035,12 @@ CREATE POLICY pol_audit_admin_only ON audit_logs FOR SELECT TO authenticated USI
 CREATE POLICY pol_anon_equipment_select ON equipment FOR SELECT TO anon USING (true);
 CREATE POLICY pol_anon_categories_select ON equipment_categories FOR SELECT TO anon USING (true);
 CREATE POLICY pol_anon_warehouses_select ON warehouse_locations FOR SELECT TO anon USING (true);
-CREATE POLICY pol_anon_orders_select ON rental_orders FOR SELECT TO anon USING (true);
-CREATE POLICY pol_anon_items_select ON rental_order_items FOR SELECT TO anon USING (true);
-CREATE POLICY pol_anon_maintenance_select ON maintenance_records FOR SELECT TO anon USING (true);
-CREATE POLICY pol_anon_inspections_select ON equipment_inspections FOR SELECT TO anon USING (true);
-CREATE POLICY pol_anon_audit_select ON audit_logs FOR SELECT TO anon USING (true);
+
 REVOKE ALL ON TABLE public.user_profiles FROM anon, authenticated;
 GRANT SELECT ON TABLE public.user_profiles TO authenticated;
 GRANT UPDATE (full_name, phone, company_name, updated_at)
     ON TABLE public.user_profiles TO authenticated;
+
 CREATE POLICY pol_profiles_auth_select ON user_profiles
     FOR SELECT TO authenticated
     USING (
@@ -727,6 +1048,7 @@ CREATE POLICY pol_profiles_auth_select ON user_profiles
         OR id = auth.uid()
         OR fn_current_user_role() IN ('admin', 'staff')
     );
+
 CREATE POLICY pol_profiles_self_update ON user_profiles
     FOR UPDATE TO authenticated
     USING (auth_user_id = auth.uid() OR id = auth.uid())
@@ -773,8 +1095,6 @@ DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
 CREATE TRIGGER on_auth_user_created
     AFTER INSERT ON auth.users
     FOR EACH ROW EXECUTE FUNCTION public.handle_new_auth_user();
-
-
 
 -- ----------------------------------------------------------------------------
 -- Data remains empty until users create accounts and operators add live records.
