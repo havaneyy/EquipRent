@@ -3,6 +3,7 @@ export type EquipmentStatus = 'available' | 'rented' | 'under_maintenance' | 'de
 export type RentalOrderStatus = 'draft' | 'confirmed' | 'in_progress' | 'completed' | 'cancelled';
 export type ItemRentalStatus = 'reserved' | 'dispatched' | 'returned' | 'damaged';
 export type PaymentStatus = 'unpaid' | 'partially_paid' | 'paid' | 'refunded';
+export type PaymentMethod = 'cash' | 'credit_card' | 'bank_transfer' | 'corporate_credit';
 export type MaintenanceType = 'scheduled_routine' | 'emergency_repair' | 'post_rental_inspection' | 'major_overhaul';
 export type MaintenanceStatus = 'pending' | 'in_progress' | 'completed' | 'cancelled';
 
@@ -145,6 +146,18 @@ export interface MaintenanceTask {
   sign_off_timestamp?: string | null;
   created_at: string;
   technician?: UserProfile;
+}
+
+export interface PaymentTransaction {
+  id: string;
+  rental_order_id: string;
+  transaction_reference: string;
+  payment_method: PaymentMethod;
+  amount: number;
+  transaction_status: 'pending' | 'succeeded' | 'failed' | 'refunded';
+  processed_at: string;
+  processed_by?: string | null;
+  gateway_response?: Record<string, unknown> | null;
 }
 
 export interface EquipmentInspection {
