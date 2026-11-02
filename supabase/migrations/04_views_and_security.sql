@@ -84,19 +84,44 @@ GROUP BY mr.id, e.id, tech.id;
 -- Tier 3: 'customer' - strictly isolated to their own records and public catalog
 -- ----------------------------------------------------------------------------
 
--- Helper function to extract user role from profile matching auth.uid()
+-- Helper functions to extract profile ID and user role from profile matching auth.uid()
+CREATE OR REPLACE FUNCTION fn_current_profile_id()
+RETURNS UUID
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+    v_profile_id UUID;
+BEGIN
+    SELECT id INTO v_profile_id
+    FROM public.user_profiles
+    WHERE auth_user_id = auth.uid()
+       OR id = auth.uid()
+    LIMIT 1;
+    RETURN v_profile_id;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION fn_current_user_role()
-RETURNS user_role_type AS $$
+RETURNS user_role_type
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
 DECLARE
     v_role user_role_type;
 BEGIN
     SELECT role INTO v_role
-    FROM user_profiles
+    FROM public.user_profiles
     WHERE auth_user_id = auth.uid()
-       OR id = auth.uid();
+       OR id = auth.uid()
+    LIMIT 1;
     RETURN COALESCE(v_role, 'customer'::user_role_type);
 END;
-$$ LANGUAGE plpgsql STABLE SECURITY DEFINER;
+$$;
 
 -- Enable RLS across all tables
 ALTER TABLE user_profiles ENABLE ROW LEVEL SECURITY;
@@ -122,21 +147,37 @@ FOR ALL TO authenticated
 USING (fn_current_user_role() IN ('admin', 'staff'))
 WITH CHECK (fn_current_user_role() IN ('admin', 'staff'));
 
--- Rental Orders RLS: Customers can only see and create their own orders
+-- Rental Orders RLS: Customers are strictly isolated to their own orders
 CREATE POLICY pol_orders_customer_select ON rental_orders
 FOR SELECT TO authenticated
 USING (
-    customer_id = auth.uid()
-    OR auth.uid() IN (SELECT id FROM user_profiles WHERE auth_user_id = auth.uid())
+    customer_id = fn_current_profile_id()
     OR fn_current_user_role() IN ('admin', 'staff')
 );
 
 CREATE POLICY pol_orders_customer_insert ON rental_orders
 FOR INSERT TO authenticated
 WITH CHECK (
-    customer_id = auth.uid()
-    OR auth.uid() IN (SELECT id FROM user_profiles WHERE auth_user_id = auth.uid())
+    (customer_id = fn_current_profile_id() AND status = 'draft')
     OR fn_current_user_role() IN ('admin', 'staff')
+);
+
+CREATE POLICY pol_orders_customer_cancel ON rental_orders
+FOR UPDATE TO authenticated
+USING (
+    customer_id = fn_current_profile_id()
+    AND status = 'draft'
+)
+WITH CHECK (
+    customer_id = fn_current_profile_id()
+    AND status = 'cancelled'
+);
+
+CREATE POLICY pol_orders_customer_delete_draft ON rental_orders
+FOR DELETE TO authenticated
+USING (
+    customer_id = fn_current_profile_id()
+    AND status = 'draft'
 );
 
 CREATE POLICY pol_orders_staff_update ON rental_orders
@@ -144,14 +185,26 @@ FOR UPDATE TO authenticated
 USING (fn_current_user_role() IN ('admin', 'staff'))
 WITH CHECK (fn_current_user_role() IN ('admin', 'staff'));
 
--- Rental Order Items RLS
+-- Rental Order Items RLS: Customers can select and insert items ONLY for their own draft orders
 CREATE POLICY pol_order_items_select ON rental_order_items
 FOR SELECT TO authenticated
 USING (
     EXISTS (
         SELECT 1 FROM rental_orders ro
         WHERE ro.id = rental_order_items.rental_order_id
-          AND (ro.customer_id = auth.uid() OR fn_current_user_role() IN ('admin', 'staff'))
+          AND (ro.customer_id = fn_current_profile_id() OR fn_current_user_role() IN ('admin', 'staff'))
+    )
+);
+
+CREATE POLICY pol_order_items_customer_insert ON rental_order_items
+FOR INSERT TO authenticated
+WITH CHECK (
+    item_status = 'reserved'
+    AND EXISTS (
+        SELECT 1 FROM rental_orders ro
+        WHERE ro.id = rental_order_items.rental_order_id
+          AND ro.customer_id = fn_current_profile_id()
+          AND ro.status = 'draft'
     )
 );
 
@@ -181,13 +234,7 @@ CREATE POLICY pol_audit_admin_only ON audit_logs
 FOR SELECT TO authenticated
 USING (fn_current_user_role() = 'admin');
 
--- Also allow anon read on public equipment for development/demonstration mode
+-- Public catalog read only (no anonymous access to orders, profiles, or logs)
 CREATE POLICY pol_anon_equipment_select ON equipment FOR SELECT TO anon USING (true);
 CREATE POLICY pol_anon_categories_select ON equipment_categories FOR SELECT TO anon USING (true);
 CREATE POLICY pol_anon_warehouses_select ON warehouse_locations FOR SELECT TO anon USING (true);
-CREATE POLICY pol_anon_orders_select ON rental_orders FOR SELECT TO anon USING (true);
-CREATE POLICY pol_anon_items_select ON rental_order_items FOR SELECT TO anon USING (true);
-CREATE POLICY pol_anon_maintenance_select ON maintenance_records FOR SELECT TO anon USING (true);
-CREATE POLICY pol_anon_inspections_select ON equipment_inspections FOR SELECT TO anon USING (true);
-CREATE POLICY pol_anon_audit_select ON audit_logs FOR SELECT TO anon USING (true);
-CREATE POLICY pol_anon_profiles_select ON user_profiles FOR SELECT TO anon USING (true);

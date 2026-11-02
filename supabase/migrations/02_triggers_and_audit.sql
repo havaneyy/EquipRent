@@ -112,28 +112,32 @@ FOR EACH ROW EXECUTE FUNCTION fn_universal_audit_logger();
 -- Auto-syncs physical unit availability based on rental lifecycle changes
 -- ----------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION fn_sync_equipment_rental_status()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
 BEGIN
     IF (TG_OP = 'INSERT' OR TG_OP = 'UPDATE') THEN
         IF NEW.item_status = 'dispatched' THEN
-            UPDATE equipment
+            UPDATE public.equipment
             SET current_status = 'rented'
             WHERE id = NEW.equipment_id;
         ELSIF NEW.item_status = 'returned' THEN
             -- Check if returned with damage notes or flagged in inspection
             IF NEW.condition_notes ILIKE '%damage%' OR NEW.condition_notes ILIKE '%repair%' THEN
-                UPDATE equipment
+                UPDATE public.equipment
                 SET current_status = 'under_maintenance',
                     operational_hours = COALESCE(NEW.return_odometer_hours, operational_hours)
                 WHERE id = NEW.equipment_id;
             ELSE
-                UPDATE equipment
+                UPDATE public.equipment
                 SET current_status = 'available',
                     operational_hours = COALESCE(NEW.return_odometer_hours, operational_hours)
                 WHERE id = NEW.equipment_id;
             END IF;
         ELSIF NEW.item_status = 'damaged' THEN
-            UPDATE equipment
+            UPDATE public.equipment
             SET current_status = 'under_maintenance',
                 operational_hours = COALESCE(NEW.return_odometer_hours, operational_hours)
             WHERE id = NEW.equipment_id;
@@ -141,7 +145,7 @@ BEGIN
     END IF;
     RETURN NEW;
 END;
-$$ LANGUAGE plpgsql;
+$$;
 
 DROP TRIGGER IF EXISTS trg_sync_equipment_status ON rental_order_items;
 CREATE TRIGGER trg_sync_equipment_status
@@ -153,7 +157,11 @@ FOR EACH ROW EXECUTE FUNCTION fn_sync_equipment_rental_status();
 -- Prevents client-side price tampering by recalculating subtotal and tax on order header
 -- ----------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION fn_recalculate_order_financials()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
 DECLARE
     v_order_id UUID;
     v_new_subtotal NUMERIC(12, 2) := 0.00;
@@ -167,21 +175,17 @@ BEGIN
         v_order_id := NEW.rental_order_id;
     END IF;
 
-    -- Aggregate subtotal from line items
-    SELECT COALESCE(SUM(item_subtotal), 0.00)
-    INTO v_new_subtotal
-    FROM rental_order_items
-    WHERE rental_order_id = v_order_id;
-
-    SELECT COALESCE(SUM(daily_insurance_rate * days_rented), 0.00)
-    INTO v_new_insurance
-    FROM rental_order_items
+    -- Aggregate subtotal and insurance from line items
+    SELECT COALESCE(SUM(item_subtotal), 0.00),
+           COALESCE(SUM(daily_insurance_rate * days_rented), 0.00)
+    INTO v_new_subtotal, v_new_insurance
+    FROM public.rental_order_items
     WHERE rental_order_id = v_order_id;
 
     v_new_tax := ROUND((v_new_subtotal + v_new_insurance) * v_tax_rate, 2);
 
     -- Update parent order
-    UPDATE rental_orders
+    UPDATE public.rental_orders
     SET subtotal_amount = v_new_subtotal,
         insurance_amount = v_new_insurance,
         tax_amount = v_new_tax,
@@ -191,7 +195,7 @@ BEGIN
 
     RETURN NULL;
 END;
-$$ LANGUAGE plpgsql;
+$$;
 
 DROP TRIGGER IF EXISTS trg_recalc_order_financials ON rental_order_items;
 CREATE TRIGGER trg_recalc_order_financials
@@ -203,49 +207,76 @@ FOR EACH ROW EXECUTE FUNCTION fn_recalculate_order_financials();
 -- Solves Theme 1 / Logistics requirement: strict isolation to prevent duplicate allocation
 -- ----------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION fn_guard_prevent_double_booking()
-RETURNS TRIGGER AS $$
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
 DECLARE
     v_order_start DATE;
     v_order_end DATE;
+    v_order_status public.rental_order_status;
     v_collision_count INT;
-    v_equip_status equipment_status_type;
+    v_maint_collision_count INT;
+    v_equip_status public.equipment_status_type;
 BEGIN
-    -- Check physical status first
+    -- Lock equipment row to serialize concurrent reservations for the same unit
     SELECT current_status INTO v_equip_status
-    FROM equipment
-    WHERE id = NEW.equipment_id;
+    FROM public.equipment
+    WHERE id = NEW.equipment_id
+    FOR UPDATE;
 
     IF v_equip_status = 'decommissioned' THEN
         RAISE EXCEPTION 'Database Integrity Error: Equipment % is decommissioned and cannot be rented.', NEW.equipment_id;
     END IF;
 
-    -- Retrieve proposed booking dates from the parent rental_orders
-    SELECT expected_start_date, expected_end_date
-    INTO v_order_start, v_order_end
-    FROM rental_orders
+    IF NEW.item_status NOT IN ('reserved', 'dispatched') THEN
+        RETURN NEW;
+    END IF;
+
+    -- Retrieve proposed booking dates and status from parent rental_orders
+    SELECT expected_start_date, expected_end_date, status
+    INTO v_order_start, v_order_end, v_order_status
+    FROM public.rental_orders
     WHERE id = NEW.rental_order_id;
 
-    -- Check for overlapping active or reserved rentals for the exact same unit
+    IF v_order_status IN ('cancelled', 'completed') THEN
+        RETURN NEW;
+    END IF;
+
+    -- Check for overlapping pending ('draft'), confirmed, or active rentals across ALL customer accounts
     SELECT COUNT(*)
     INTO v_collision_count
-    FROM rental_order_items roi
-    JOIN rental_orders ro ON ro.id = roi.rental_order_id
+    FROM public.rental_order_items roi
+    JOIN public.rental_orders ro ON ro.id = roi.rental_order_id
     WHERE roi.equipment_id = NEW.equipment_id
       AND roi.id <> COALESCE(NEW.id, '00000000-0000-0000-0000-000000000000'::UUID)
       AND roi.item_status IN ('reserved', 'dispatched')
-      AND ro.status IN ('confirmed', 'in_progress')
+      AND ro.status IN ('draft', 'confirmed', 'in_progress')
       AND (
           (ro.expected_start_date <= v_order_end) AND (ro.expected_end_date >= v_order_start)
       );
 
     IF v_collision_count > 0 THEN
-        RAISE EXCEPTION 'Double-Booking Violation: Equipment unit % is already booked or dispatched for an overlapping date range (% to %).',
-            NEW.equipment_id, v_order_start, v_order_end;
+        RAISE EXCEPTION 'Double-Booking Violation: Equipment unit is already reserved or rented for an overlapping date range (% to %).',
+            v_order_start, v_order_end;
+    END IF;
+
+    SELECT COUNT(*)
+    INTO v_maint_collision_count
+    FROM public.maintenance_records mr
+    WHERE mr.equipment_id = NEW.equipment_id
+      AND mr.maintenance_status IN ('pending', 'in_progress')
+      AND mr.scheduled_date BETWEEN v_order_start AND v_order_end;
+
+    IF v_maint_collision_count > 0 THEN
+        RAISE EXCEPTION 'Maintenance Conflict: Equipment has scheduled maintenance during (% to %).',
+            v_order_start, v_order_end;
     END IF;
 
     RETURN NEW;
 END;
-$$ LANGUAGE plpgsql;
+$$;
 
 DROP TRIGGER IF EXISTS trg_guard_double_booking ON rental_order_items;
 CREATE TRIGGER trg_guard_double_booking
