@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import type {
   Equipment,
+  EquipmentBookedRange,
   RentalOrder,
   MaintenanceRecord,
   AuditLog,
@@ -13,6 +14,7 @@ import {
   isSupabaseConfigured,
   fetchEquipmentList,
   fetchEquipmentCategories,
+  fetchEquipmentBookedRanges,
   fetchWarehouses,
   createEquipment,
   updateEquipmentDetails,
@@ -42,6 +44,12 @@ const toDateInputValue = (date: Date) => {
   const month = String(date.getMonth() + 1).padStart(2, '0');
   const day = String(date.getDate()).padStart(2, '0');
   return `${year}-${month}-${day}`;
+};
+
+const addDaysToDateStr = (dateStr: string, daysToAdd: number): string => {
+  const [year, month, day] = dateStr.split('-').map(Number);
+  if (!year || !month || !day) return dateStr;
+  return toDateInputValue(new Date(year, month - 1, day + daysToAdd));
 };
 
 export default function App() {
@@ -93,6 +101,7 @@ export default function App() {
   const [categoriesList, setCategoriesList] = useState<EquipmentCategory[]>([]);
   const [warehousesList, setWarehousesList] = useState<WarehouseLocation[]>([]);
   const [orders, setOrders] = useState<RentalOrder[]>([]);
+  const [bookedRanges, setBookedRanges] = useState<EquipmentBookedRange[]>([]);
   const [maintenance, setMaintenance] = useState<MaintenanceRecord[]>([]);
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
   const [usersList, setUsersList] = useState<UserProfile[]>([]);
@@ -178,11 +187,12 @@ export default function App() {
   const reloadData = async () => {
     if (!currentUser) return;
     try {
-      const [eq, cats, whs, ord, maint, logs, users] = await Promise.all([
+      const [eq, cats, whs, ord, ranges, maint, logs, users] = await Promise.all([
         fetchEquipmentList(),
         fetchEquipmentCategories().catch(() => []),
         currentRole === 'admin' ? fetchWarehouses().catch(() => []) : Promise.resolve([]),
         fetchRentalOrders(currentRole === 'customer' ? currentUser.id : undefined),
+        fetchEquipmentBookedRanges().catch(() => []),
         currentRole === 'customer' ? Promise.resolve([]) : fetchMaintenanceRecords(),
         currentRole === 'admin' ? fetchAuditLogs().catch(() => []) : Promise.resolve([]),
         currentRole === 'admin' ? fetchUserProfiles().catch(() => []) : Promise.resolve([]),
@@ -194,6 +204,7 @@ export default function App() {
         setCalEquipId(eq[0].id);
       }
       setOrders(ord);
+      setBookedRanges(ranges);
       setMaintenance(maint);
       setAuditLogs(logs);
       setUsersList(users);
@@ -374,6 +385,99 @@ export default function App() {
     ];
   }, [currentRole, orders, maintenance.length, auditLogs.length]);
 
+  // Enforce strict role-based page/tab isolation so accounts can never view unauthorized pages
+  useEffect(() => {
+    const allowedTabs = new Set(navTabs.map((t) => t.label));
+    // Staff and Admin may also inspect the read-only Availability Calendar from Fleet Inventory
+    if (currentRole === 'staff' || currentRole === 'admin') {
+      allowedTabs.add('Availability Calendar');
+    }
+    if (!allowedTabs.has(activeTab)) {
+      setActiveTab('Dashboard');
+    }
+  }, [activeTab, currentRole, navTabs]);
+
+  // Privacy-safe cross-account availability lookup (uses anonymized bookedRanges + local state)
+  const getEquipmentBlockOnDate = (
+    equipmentId: string,
+    date: string
+  ): 'rented' | 'reserved' | 'maintenance' | null => {
+    for (const range of bookedRanges) {
+      if (range.equipment_id === equipmentId && range.start_date <= date && date <= range.end_date) {
+        return range.block_type;
+      }
+    }
+    const maintMatch = maintenance.some(
+      (record) =>
+        record.equipment_id === equipmentId &&
+        record.scheduled_date === date &&
+        record.maintenance_status !== 'completed' &&
+        record.maintenance_status !== 'cancelled'
+    );
+    if (maintMatch) return 'maintenance';
+
+    const orderMatch = orders.find(
+      (order) =>
+        order.status !== 'cancelled' &&
+        order.status !== 'completed' &&
+        order.items?.some((item) => item.equipment_id === equipmentId) &&
+        order.expected_start_date <= date &&
+        date <= order.expected_end_date
+    );
+    if (orderMatch) {
+      return orderMatch.status === 'in_progress' ? 'rented' : 'reserved';
+    }
+    return null;
+  };
+
+  const doesRangeOverlapBooking = (
+    equipmentId: string,
+    startDate: string,
+    endDate: string
+  ): 'rented' | 'reserved' | 'maintenance' | null => {
+    for (const range of bookedRanges) {
+      if (
+        range.equipment_id === equipmentId &&
+        range.start_date <= endDate &&
+        range.end_date >= startDate
+      ) {
+        return range.block_type;
+      }
+    }
+    const maintOverlap = maintenance.some(
+      (record) =>
+        record.equipment_id === equipmentId &&
+        record.maintenance_status !== 'completed' &&
+        record.maintenance_status !== 'cancelled' &&
+        record.scheduled_date >= startDate &&
+        record.scheduled_date <= endDate
+    );
+    if (maintOverlap) return 'maintenance';
+
+    const orderOverlap = orders.find(
+      (order) =>
+        order.status !== 'cancelled' &&
+        order.status !== 'completed' &&
+        order.items?.some((item) => item.equipment_id === equipmentId) &&
+        order.expected_start_date <= endDate &&
+        order.expected_end_date >= startDate
+    );
+    if (orderOverlap) {
+      return orderOverlap.status === 'in_progress' ? 'rented' : 'reserved';
+    }
+    return null;
+  };
+
+  const findNextAvailableDate = (equipmentId: string): string => {
+    for (let offset = 0; offset < 60; offset += 1) {
+      const candidate = addDaysToDateStr(todayDate, offset);
+      if (!getEquipmentBlockOnDate(equipmentId, candidate)) {
+        return candidate;
+      }
+    }
+    return todayDate;
+  };
+
   const showToast = (msg: string) => {
     setToast(msg);
     setTimeout(() => setToast(''), 4000);
@@ -386,7 +490,7 @@ export default function App() {
     showToast(`Welcome back, ${profile.full_name}!`);
   };
 
-  // 1. Customer Booking Submit with Future Date Validation
+  // 1. Customer Booking Submit with Future Date & Double-Booking Overlap Validation
   const handleBookingSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!rentingEquipment || !currentUser) return;
@@ -414,7 +518,18 @@ export default function App() {
       if (Number.isNaN(start.getTime())) {
         throw new Error('Choose a valid rental start date.');
       }
-      const end = new Date(start.getTime() + parsedDays * 86400000);
+      const startDateStr = toDateInputValue(start);
+      const endDateStr = addDaysToDateStr(startDateStr, parsedDays - 1);
+
+      const overlapReason = doesRangeOverlapBooking(rentingEquipment.id, startDateStr, endDateStr);
+      if (overlapReason) {
+        throw new Error(
+          overlapReason === 'maintenance'
+            ? `This equipment is scheduled for maintenance during ${startDateStr} to ${endDateStr}.`
+            : `This equipment is already reserved or rented during ${startDateStr} to ${endDateStr}. Please select open dates.`
+        );
+      }
+
       const dailyInsuranceRate = rentingEquipment.category?.base_daily_insurance_rate ?? 0;
 
       await createRentalOrder({
@@ -423,8 +538,8 @@ export default function App() {
         unitDailyRate: rentingEquipment.daily_rental_rate,
         dailyInsuranceRate,
         days: parsedDays,
-        startDate: toDateInputValue(start),
-        endDate: toDateInputValue(end),
+        startDate: startDateStr,
+        endDate: endDateStr,
         deliveryAddress: bookAddress,
         customerName: bookCustomerName,
         customerPhone: formatPhilippinePhone(bookCustomerPhone),
@@ -741,32 +856,16 @@ export default function App() {
     return equipmentList.find((e) => e.id === calEquipId) || equipmentList[0];
   }, [equipmentList, calEquipId]);
 
-  const isEquipmentBookedOnDate = (equipmentId: string, date: string) =>
-    orders.some(
-      (order) =>
-        order.status !== 'cancelled' &&
-        order.status !== 'completed' &&
-        order.items?.some((item) => item.equipment_id === equipmentId) &&
-        order.expected_start_date <= date &&
-        date <= order.expected_end_date
-    );
-
-  const hasMaintenanceOnDate = (equipmentId: string, date: string) =>
-    maintenance.some(
-      (record) =>
-        record.equipment_id === equipmentId &&
-        record.scheduled_date === date &&
-        record.maintenance_status !== 'completed' &&
-        record.maintenance_status !== 'cancelled'
-    );
+  const selectedDateBlockReason = selectedCalEquip
+    ? getEquipmentBlockOnDate(selectedCalEquip.id, calSelectedDate)
+    : null;
 
   const selectedDateBlocked = Boolean(
     selectedCalEquip &&
       (calSelectedDate < todayDate ||
         selectedCalEquip.current_status === 'decommissioned' ||
         selectedCalEquip.current_status === 'under_maintenance' ||
-        isEquipmentBookedOnDate(selectedCalEquip.id, calSelectedDate) ||
-        hasMaintenanceOnDate(selectedCalEquip.id, calSelectedDate) ||
+        selectedDateBlockReason !== null ||
         (calSelectedDate === todayDate && selectedCalEquip.current_status !== 'available'))
   );
 
@@ -789,6 +888,16 @@ export default function App() {
   // Booking calculations for modal
   const bookingInsuranceRate = rentingEquipment?.category?.base_daily_insurance_rate ?? 0;
   const bookingDays = Number(bookDays) || 0;
+  const bookingEndDate =
+    bookStartDate && bookingDays >= 1 ? addDaysToDateStr(bookStartDate, bookingDays - 1) : '';
+  const bookingOverlapReason =
+    rentingEquipment && bookStartDate
+      ? doesRangeOverlapBooking(
+          rentingEquipment.id,
+          bookStartDate,
+          bookingEndDate || bookStartDate
+        )
+      : null;
   const bookingSubtotal = rentingEquipment ? rentingEquipment.daily_rental_rate * bookingDays : 0;
   const bookingInsurance = bookingInsuranceRate * bookingDays;
   const bookingTax = Math.round((bookingSubtotal + bookingInsurance) * 0.08 * 100) / 100;
@@ -1030,35 +1139,77 @@ export default function App() {
                   </div>
                 </div>
 
-                <div className="donut-breakdown-card">
-                  <span style={{ fontSize: 12, color: 'var(--text-muted)', fontWeight: 600 }}>Fleet Valuation</span>
-                  <div style={{ fontSize: 24, fontWeight: 800, color: '#111827', margin: '6px 0' }}>
-                    {formatPHP(totalFleetValuation)}
-                  </div>
-                  <div style={{ fontSize: 12, color: 'var(--purple-main)', fontWeight: 600 }}>
-                    {equipmentList.length} Listed Assets
-                  </div>
-                </div>
+                {currentRole === 'customer' ? (
+                  <>
+                    <div className="donut-breakdown-card">
+                      <span style={{ fontSize: 12, color: 'var(--text-muted)', fontWeight: 600 }}>
+                        My Active Rentals
+                      </span>
+                      <div style={{ fontSize: 26, fontWeight: 800, color: '#111827', margin: '6px 0' }}>
+                        {activeContracts.length} <span style={{ fontSize: 14, fontWeight: 500 }}>Orders</span>
+                      </div>
+                      <div style={{ fontSize: 12, color: '#047857', fontWeight: 600 }}>
+                        Confirmed or Dispatched
+                      </div>
+                    </div>
 
-                <div className="donut-breakdown-card">
-                  <span style={{ fontSize: 12, color: 'var(--text-muted)', fontWeight: 600 }}>Total Revenue</span>
-                  <div style={{ fontSize: 24, fontWeight: 800, color: '#111827', margin: '6px 0' }}>
-                    {formatPHP(totalRentalRevenue)}
-                  </div>
-                  <div style={{ fontSize: 12, color: '#047857', fontWeight: 600 }}>
-                    {orders.filter((o) => o.status !== 'cancelled').length} Confirmed Bookings
-                  </div>
-                </div>
+                    <div className="donut-breakdown-card">
+                      <span style={{ fontSize: 12, color: 'var(--text-muted)', fontWeight: 600 }}>
+                        My Pending Requests
+                      </span>
+                      <div style={{ fontSize: 26, fontWeight: 800, color: '#111827', margin: '6px 0' }}>
+                        {pendingRequests.length} <span style={{ fontSize: 14, fontWeight: 500 }}>Pending</span>
+                      </div>
+                      <div style={{ fontSize: 12, color: '#b45309', fontWeight: 600 }}>
+                        Awaiting Staff Review
+                      </div>
+                    </div>
 
-                <div className="donut-breakdown-card">
-                  <span style={{ fontSize: 12, color: 'var(--text-muted)', fontWeight: 600 }}>Active Rentals</span>
-                  <div style={{ fontSize: 26, fontWeight: 800, color: '#111827', margin: '6px 0' }}>
-                    {activeContracts.length} <span style={{ fontSize: 14, fontWeight: 500 }}>Orders</span>
-                  </div>
-                  <div style={{ fontSize: 12, color: '#b45309', fontWeight: 600 }}>
-                    {pendingRequests.length} Pending Approval
-                  </div>
-                </div>
+                    <div className="donut-breakdown-card">
+                      <span style={{ fontSize: 12, color: 'var(--text-muted)', fontWeight: 600 }}>
+                        My Rental Total
+                      </span>
+                      <div style={{ fontSize: 24, fontWeight: 800, color: '#111827', margin: '6px 0' }}>
+                        {formatPHP(totalRentalRevenue)}
+                      </div>
+                      <div style={{ fontSize: 12, color: 'var(--purple-main)', fontWeight: 600 }}>
+                        {orders.filter((o) => o.status !== 'cancelled').length} Personal Bookings
+                      </div>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div className="donut-breakdown-card">
+                      <span style={{ fontSize: 12, color: 'var(--text-muted)', fontWeight: 600 }}>Fleet Valuation</span>
+                      <div style={{ fontSize: 24, fontWeight: 800, color: '#111827', margin: '6px 0' }}>
+                        {formatPHP(totalFleetValuation)}
+                      </div>
+                      <div style={{ fontSize: 12, color: 'var(--purple-main)', fontWeight: 600 }}>
+                        {equipmentList.length} Listed Assets
+                      </div>
+                    </div>
+
+                    <div className="donut-breakdown-card">
+                      <span style={{ fontSize: 12, color: 'var(--text-muted)', fontWeight: 600 }}>Total Revenue</span>
+                      <div style={{ fontSize: 24, fontWeight: 800, color: '#111827', margin: '6px 0' }}>
+                        {formatPHP(totalRentalRevenue)}
+                      </div>
+                      <div style={{ fontSize: 12, color: '#047857', fontWeight: 600 }}>
+                        {orders.filter((o) => o.status !== 'cancelled').length} Confirmed Bookings
+                      </div>
+                    </div>
+
+                    <div className="donut-breakdown-card">
+                      <span style={{ fontSize: 12, color: 'var(--text-muted)', fontWeight: 600 }}>Active Rentals</span>
+                      <div style={{ fontSize: 26, fontWeight: 800, color: '#111827', margin: '6px 0' }}>
+                        {activeContracts.length} <span style={{ fontSize: 14, fontWeight: 500 }}>Orders</span>
+                      </div>
+                      <div style={{ fontSize: 12, color: '#b45309', fontWeight: 600 }}>
+                        {pendingRequests.length} Pending Approval
+                      </div>
+                    </div>
+                  </>
+                )}
               </div>
 
               {/* Admin Overview Details */}
@@ -1208,7 +1359,7 @@ export default function App() {
                             style={{ padding: '6px 14px', fontSize: 11 }}
                             onClick={() => {
                               setRentingEquipment(item);
-                              setBookStartDate(todayDate);
+                              setBookStartDate(findNextAvailableDate(item.id));
                               setBookCustomerName(currentUser.full_name);
                               setBookCustomerPhone(currentUser.phone);
                             }}
@@ -1351,7 +1502,7 @@ export default function App() {
                               disabled={item.current_status !== 'available'}
                               onClick={() => {
                                 setRentingEquipment(item);
-                                setBookStartDate(todayDate);
+                                setBookStartDate(findNextAvailableDate(item.id));
                                 setBookCustomerName(currentUser.full_name);
                                 setBookCustomerPhone(currentUser.phone);
                               }}
@@ -1509,8 +1660,7 @@ export default function App() {
                   const isSelected = calSelectedDate === dateStr;
                   const isCurrentMonth = date.getMonth() === calendarMonthIndex;
                   const isPast = dateStr < todayDate;
-                  const isBooked = isEquipmentBookedOnDate(calEquipId, dateStr);
-                  const isMaintenance = hasMaintenanceOnDate(calEquipId, dateStr);
+                  const blockReason = getEquipmentBlockOnDate(calEquipId, dateStr);
                   const isUnavailable = Boolean(
                     selectedCalEquip &&
                       (selectedCalEquip.current_status === 'decommissioned' ||
@@ -1522,13 +1672,26 @@ export default function App() {
                     <div
                       key={dateStr}
                       className={`calendar-day-cell ${isCurrentMonth ? '' : 'other-month'} ${isSelected ? 'selected' : ''}`}
-                      style={{ opacity: isPast ? 0.45 : 1, cursor: isPast ? 'not-allowed' : 'pointer' }}
+                      style={{
+                        opacity: isPast ? 0.45 : blockReason ? 0.8 : 1,
+                        cursor: isPast ? 'not-allowed' : 'pointer',
+                      }}
                       onClick={() => {
                         if (isPast) {
                           showToast('Cannot select past dates. Reservations require today or future dates.');
                           return;
                         }
                         setCalSelectedDate(dateStr);
+                        if (blockReason === 'reserved' || blockReason === 'rented') {
+                          showToast(
+                            `This equipment is already ${blockReason} on ${dateStr}. Please choose an Open date.`
+                          );
+                          return;
+                        }
+                        if (blockReason === 'maintenance' || isUnavailable) {
+                          showToast(`This equipment is unavailable on ${dateStr}.`);
+                          return;
+                        }
                         setBookStartDate(dateStr);
                       }}
                     >
@@ -1537,10 +1700,12 @@ export default function App() {
                         <span className="calendar-chip" style={{ background: '#f3f4f6', color: '#9ca3af' }}>
                           Past
                         </span>
-                      ) : isMaintenance ? (
+                      ) : blockReason === 'maintenance' ? (
                         <span className="calendar-chip maintenance">Service</span>
-                      ) : isBooked ? (
+                      ) : blockReason === 'rented' ? (
                         <span className="calendar-chip booked">Rented</span>
+                      ) : blockReason === 'reserved' ? (
+                        <span className="calendar-chip booked">Reserved</span>
                       ) : isUnavailable ? (
                         <span className="calendar-chip booked">Unavailable</span>
                       ) : (
@@ -1575,34 +1740,47 @@ export default function App() {
                       {formatPHP(selectedCalEquip.daily_rental_rate)}/day ·{' '}
                       <strong
                         style={{
-                          color: selectedCalEquip.current_status === 'available' ? '#047857' : '#b45309',
+                          color: !selectedDateBlocked ? '#047857' : '#b45309',
                           textTransform: 'capitalize',
                         }}
                       >
-                        {selectedCalEquip.current_status}
+                        {selectedDateBlockReason
+                          ? `Already ${selectedDateBlockReason}`
+                          : selectedDateBlocked
+                            ? 'Unavailable'
+                            : 'Available'}
                       </strong>
                     </p>
                   </div>
 
-                  <button
-                    className="primary-purple-btn"
-                    disabled={selectedDateBlocked}
-                    onClick={() => {
-                      setRentingEquipment(selectedCalEquip);
-                      setBookStartDate(calSelectedDate);
-                      setBookCustomerName(currentUser.full_name);
-                      setBookCustomerPhone(currentUser.phone);
-                    }}
-                  >
-                    Reserve on {calSelectedDate}
-                  </button>
+                  {currentRole === 'customer' ? (
+                    <button
+                      className="primary-purple-btn"
+                      disabled={selectedDateBlocked}
+                      style={{ opacity: selectedDateBlocked ? 0.5 : 1, cursor: selectedDateBlocked ? 'not-allowed' : 'pointer' }}
+                      onClick={() => {
+                        setRentingEquipment(selectedCalEquip);
+                        setBookStartDate(calSelectedDate);
+                        setBookCustomerName(currentUser.full_name);
+                        setBookCustomerPhone(currentUser.phone);
+                      }}
+                    >
+                      {selectedDateBlockReason
+                        ? `Unavailable on ${calSelectedDate}`
+                        : `Reserve on ${calSelectedDate}`}
+                    </button>
+                  ) : (
+                    <span className={selectedDateBlocked ? 'pending-status-badge' : 'confirmed-status-badge'}>
+                      {selectedDateBlocked ? 'Booked / Unavailable' : 'Open for Booking'}
+                    </span>
+                  )}
                 </div>
               )}
             </div>
           )}
 
           {/* TAB 4: MY RESERVATIONS (CUSTOMER VIEW WITH CANCELLATION & ACCURATE TOTAL DUE) */}
-          {activeTab === 'My Reservations' && (
+          {currentRole === 'customer' && activeTab === 'My Reservations' && (
             <div className="transactions-table-card" style={{ marginTop: 6 }}>
               <div className="table-card-header">
                 <div>
@@ -1697,7 +1875,7 @@ export default function App() {
           )}
 
           {/* TAB 5: MERGED ORDERS & REQUESTS (STAFF VIEW) */}
-          {activeTab === 'Orders & Requests' && (
+          {currentRole === 'staff' && activeTab === 'Orders & Requests' && (
             <div className="transactions-table-card" style={{ marginTop: 6 }}>
               <div className="table-card-header">
                 <div>
@@ -1852,7 +2030,7 @@ export default function App() {
           )}
 
           {/* TAB 6: DISPATCH & CHECKOUT (STAFF) */}
-          {activeTab === 'Dispatch & Checkout' && (
+          {currentRole === 'staff' && activeTab === 'Dispatch & Checkout' && (
             <div className="transactions-table-card" style={{ marginTop: 6 }}>
               <div className="table-card-header">
                 <div>
@@ -1929,7 +2107,7 @@ export default function App() {
           )}
 
           {/* TAB 7: RETURN & INSPECTION (STAFF CAN ONLY PRESS RETURN IF EQUIPMENT HAS RETURNED) */}
-          {activeTab === 'Return & Inspection' && (
+          {currentRole === 'staff' && activeTab === 'Return & Inspection' && (
             <div className="transactions-table-card" style={{ marginTop: 6 }}>
               <div className="table-card-header">
                 <div>
@@ -2014,7 +2192,7 @@ export default function App() {
           )}
 
           {/* TAB 8: ADMIN BORROWED & RETURNED ITEMS TRACKING */}
-          {activeTab === 'Borrowed & Returned Items' && (
+          {currentRole === 'admin' && activeTab === 'Borrowed & Returned Items' && (
             <div className="transactions-table-card" style={{ marginTop: 6 }}>
               <div className="table-card-header">
                 <div>
@@ -2133,7 +2311,7 @@ export default function App() {
           )}
 
           {/* TAB 9: ADMIN USER MANAGEMENT (REMOVE STAFF & CUSTOMER, ADD STAFF) */}
-          {activeTab === 'User Management' && (
+          {currentRole === 'admin' && activeTab === 'User Management' && (
             <div className="transactions-table-card" style={{ marginTop: 6 }}>
               <div className="table-card-header">
                 <div>
@@ -2254,7 +2432,8 @@ export default function App() {
           )}
 
           {/* TAB 10: MAINTENANCE QUEUE & OVERSIGHT */}
-          {(activeTab === 'Maintenance Oversight' || activeTab === 'Maintenance Queue') && (
+          {currentRole !== 'customer' &&
+            (activeTab === 'Maintenance Oversight' || activeTab === 'Maintenance Queue') && (
             <div className="transactions-table-card" style={{ marginTop: 6 }}>
               <div className="table-card-header">
                 <div>
@@ -2303,7 +2482,7 @@ export default function App() {
           )}
 
           {/* TAB 11: AUDIT LOGS */}
-          {activeTab === 'Engine Audit Logs' && (
+          {currentRole === 'admin' && activeTab === 'Engine Audit Logs' && (
             <div className="transactions-table-card" style={{ marginTop: 6 }}>
               <div className="table-card-header">
                 <div>
@@ -2655,13 +2834,7 @@ export default function App() {
                 <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 5 }}>
                   <span>Rental Period</span>
                   <strong>
-                    {bookStartDate} &rarr;{' '}
-                    {bookStartDate && bookDays
-                      ? toDateInputValue(
-                          new Date(new Date(`${bookStartDate}T00:00:00`).getTime() + bookingDays * 86400000)
-                        )
-                      : '—'}{' '}
-                    ({bookDays || '—'} days)
+                    {bookStartDate} &rarr; {bookingEndDate || '—'} ({bookDays || '—'} days)
                   </strong>
                 </div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 5 }}>
@@ -2693,9 +2866,29 @@ export default function App() {
                   <span>Total Due</span>
                   <span>{formatPHP(bookingTotal)}</span>
                 </div>
-                <div style={{ marginTop: 8, fontSize: 11, color: '#b45309', fontWeight: 600 }}>
-                  ⏳ Status will be set to Pending after confirmation
-                </div>
+                {bookingOverlapReason ? (
+                  <div
+                    role="alert"
+                    style={{
+                      marginTop: 10,
+                      padding: '8px 12px',
+                      borderRadius: 10,
+                      background: 'var(--red-bg)',
+                      color: 'var(--red-kpi)',
+                      fontSize: 11,
+                      fontWeight: 700,
+                    }}
+                  >
+                    ⚠️ Unavailable: Another reservation or maintenance block already covers{' '}
+                    {bookStartDate}
+                    {bookingEndDate && bookingEndDate !== bookStartDate ? ` to ${bookingEndDate}` : ''}.
+                    Please select different dates.
+                  </div>
+                ) : (
+                  <div style={{ marginTop: 8, fontSize: 11, color: '#b45309', fontWeight: 600 }}>
+                    ⏳ Status will be set to Pending after confirmation
+                  </div>
+                )}
               </div>
 
               <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10 }}>
@@ -2706,7 +2899,15 @@ export default function App() {
                 >
                   Cancel
                 </button>
-                <button type="submit" className="primary-purple-btn">
+                <button
+                  type="submit"
+                  className="primary-purple-btn"
+                  disabled={Boolean(bookingOverlapReason)}
+                  style={{
+                    opacity: bookingOverlapReason ? 0.5 : 1,
+                    cursor: bookingOverlapReason ? 'not-allowed' : 'pointer',
+                  }}
+                >
                   Confirm Reservation Request
                 </button>
               </div>
