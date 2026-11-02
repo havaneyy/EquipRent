@@ -3,7 +3,12 @@ import type {
   Equipment,
   EquipmentBookedRange,
   RentalOrder,
+  PaymentTransaction,
+  PaymentMethod,
+  EquipmentInspection,
   MaintenanceRecord,
+  MaintenanceTask,
+  MaintenanceType,
   AuditLog,
   UserRole,
   UserProfile,
@@ -12,22 +17,36 @@ import type {
 } from './types/database';
 import {
   isSupabaseConfigured,
+  subscribeToDatabaseSync,
   fetchEquipmentList,
   fetchEquipmentCategories,
+  createEquipmentCategory,
+  deleteEquipmentCategory,
   fetchEquipmentBookedRanges,
   fetchWarehouses,
+  createWarehouse,
+  deleteWarehouse,
   createEquipment,
   updateEquipmentDetails,
   deleteEquipment,
   fetchRentalOrders,
   createRentalOrder,
+  addOrderItem,
+  updateOrderItem,
+  deleteOrderItem,
   cancelRentalOrder,
   updateRentalOrderStatus,
   rescheduleConfirmedOrderDates,
   staffCancelConfirmedOrder,
+  fetchPaymentTransactions,
+  recordOrderPayment,
   executeRentalDispatch,
+  fetchEquipmentInspections,
   executeEquipmentReturn,
   fetchMaintenanceRecords,
+  sendEquipmentToMaintenance,
+  addMaintenanceTask,
+  deleteMaintenanceTask,
   completeMaintenanceRepair,
   fetchAuditLogs,
   fetchUserProfiles,
@@ -52,6 +71,14 @@ const addDaysToDateStr = (dateStr: string, daysToAdd: number): string => {
   const [year, month, day] = dateStr.split('-').map(Number);
   if (!year || !month || !day) return dateStr;
   return toDateInputValue(new Date(year, month - 1, day + daysToAdd));
+};
+
+const formatOrderEquipmentLabel = (ord: RentalOrder): string => {
+  const items = ord.items || [];
+  if (items.length === 0) return 'Equipment';
+  if (items.length === 1) return items[0]?.equipment?.model_name || 'Equipment';
+  const first = items[0]?.equipment?.model_name || 'Equipment';
+  return `${first} +${items.length - 1} more (${items.length} items)`;
 };
 
 export default function App() {
@@ -103,6 +130,8 @@ export default function App() {
   const [categoriesList, setCategoriesList] = useState<EquipmentCategory[]>([]);
   const [warehousesList, setWarehousesList] = useState<WarehouseLocation[]>([]);
   const [orders, setOrders] = useState<RentalOrder[]>([]);
+  const [payments, setPayments] = useState<PaymentTransaction[]>([]);
+  const [inspections, setInspections] = useState<EquipmentInspection[]>([]);
   const [bookedRanges, setBookedRanges] = useState<EquipmentBookedRange[]>([]);
   const [maintenance, setMaintenance] = useState<MaintenanceRecord[]>([]);
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
@@ -170,8 +199,56 @@ export default function App() {
 
   // Admin User & Borrowed filters
   const [adminUserTab, setAdminUserTab] = useState<'staff' | 'customer'>('staff');
-  const [adminBorrowedTab, setAdminBorrowedTab] = useState<'borrowed' | 'returned'>('borrowed');
+  const [adminBorrowedTab, setAdminBorrowedTab] = useState<'borrowed' | 'returned' | 'orders'>('borrowed');
   const [userSearch, setUserSearch] = useState('');
+
+  // Order Items CRUD modal state (syncs rental_order_items <-> rental_orders)
+  const [managingOrderId, setManagingOrderId] = useState<string | null>(null);
+  const [itemEditDrafts, setItemEditDrafts] = useState<
+    Record<string, { rate: string; days: string }>
+  >({});
+  const [newOrderItemEquipId, setNewOrderItemEquipId] = useState('');
+  const [newOrderItemDays, setNewOrderItemDays] = useState('1');
+  const [newOrderItemRate, setNewOrderItemRate] = useState('');
+  const [orderItemSaving, setOrderItemSaving] = useState(false);
+
+  // Payment Transaction modal state (syncs payment_transactions <-> rental_orders.payment_status)
+  const [payingOrder, setPayingOrder] = useState<RentalOrder | null>(null);
+  const [paymentMethod, setPaymentMethod] = useState<PaymentMethod>('cash');
+  const [paymentAmount, setPaymentAmount] = useState('');
+  const [paymentSaving, setPaymentSaving] = useState(false);
+
+  // Send to Maintenance & Maintenance Tasks modal state (syncs equipment + maintenance_records + maintenance_tasks)
+  const [maintTargetEquip, setMaintTargetEquip] = useState<Equipment | null>(null);
+  const [maintType, setMaintType] = useState<MaintenanceType>('scheduled_routine');
+  const [maintDesc, setMaintDesc] = useState('');
+  const [maintTaskName, setMaintTaskName] = useState('Diagnostic Inspection & Calibration');
+  const [maintHours, setMaintHours] = useState('1');
+  const [maintHourlyRate, setMaintHourlyRate] = useState('500');
+  const [maintSaving, setMaintSaving] = useState(false);
+
+  const [managingMaintId, setManagingMaintId] = useState<string | null>(null);
+  const [newTaskName, setNewTaskName] = useState('');
+  const [newTaskHours, setNewTaskHours] = useState('1');
+  const [newTaskRate, setNewTaskRate] = useState('500');
+  const [newTaskReport, setNewTaskReport] = useState('');
+  const [taskSaving, setTaskSaving] = useState(false);
+
+  // Admin Categories & Studio Branches CRUD modals (equipment_categories & warehouse_locations)
+  const [isManageCategoriesOpen, setIsManageCategoriesOpen] = useState(false);
+  const [catName, setCatName] = useState('');
+  const [catCode, setCatCode] = useState('');
+  const [catDesc, setCatDesc] = useState('');
+  const [catInsuranceRate, setCatInsuranceRate] = useState('150');
+
+  const [isManageWarehousesOpen, setIsManageWarehousesOpen] = useState(false);
+  const [whCode, setWhCode] = useState('');
+  const [whName, setWhName] = useState('');
+  const [whAddress, setWhAddress] = useState('');
+  const [whCity, setWhCity] = useState('Quezon City');
+  const [whRegion, setWhRegion] = useState('NCR');
+  const [whPhone, setWhPhone] = useState('+63 917 555 0100');
+  const [whCapacity, setWhCapacity] = useState('150');
 
   // Sync profile form when user changes
   useEffect(() => {
@@ -188,11 +265,15 @@ export default function App() {
   const reloadData = async () => {
     if (!currentUser) return;
     try {
-      const [eq, cats, whs, ord, ranges, maint, logs, users] = await Promise.all([
+      const [eq, cats, whs, ord, pays, insps, ranges, maint, logs, users] = await Promise.all([
         fetchEquipmentList(),
         fetchEquipmentCategories().catch(() => []),
-        currentRole === 'admin' ? fetchWarehouses().catch(() => []) : Promise.resolve([]),
+        fetchWarehouses().catch(() => []),
         fetchRentalOrders(currentRole === 'customer' ? currentUser.id : undefined),
+        fetchPaymentTransactions().catch(() => []),
+        currentRole === 'customer'
+          ? Promise.resolve([])
+          : fetchEquipmentInspections().catch(() => []),
         fetchEquipmentBookedRanges().catch(() => []),
         currentRole === 'customer' ? Promise.resolve([]) : fetchMaintenanceRecords(),
         currentRole === 'admin' ? fetchAuditLogs().catch(() => []) : Promise.resolve([]),
@@ -207,6 +288,8 @@ export default function App() {
         setCalEquipId(eq[0].id);
       }
       setOrders(ord);
+      setPayments(pays);
+      setInspections(insps);
       setBookedRanges(ranges);
       setMaintenance(maint);
       setAuditLogs(logs);
@@ -221,9 +304,13 @@ export default function App() {
   };
 
   useEffect(() => {
-    if (currentUser) {
-      reloadData();
-    }
+    if (!currentUser) return;
+    void reloadData();
+    // Live Realtime subscription so database edits anywhere immediately sync UI state
+    const unsubscribe = subscribeToDatabaseSync(() => {
+      void reloadData();
+    });
+    return () => unsubscribe();
   }, [currentUser]);
 
   // Computed live metrics from Supabase database
@@ -352,7 +439,7 @@ export default function App() {
     });
   }, [orders]);
 
-  // Unified Maintenance Queue: combines maintenance_records + any equipment marked under_maintenance
+  // Unified Maintenance Queue: combines maintenance_records (with joined maintenance_tasks) + any equipment marked under_maintenance
   const maintenanceQueueItems = useMemo(() => {
     const openEquipmentIds = new Set<string>();
     const rows: Array<{
@@ -365,6 +452,8 @@ export default function App() {
       maintenanceType: string;
       notes: string;
       scheduledDate: string;
+      totalCost: number;
+      tasks: MaintenanceTask[];
       status: 'pending' | 'in_progress' | 'completed' | 'cancelled';
     }> = [];
 
@@ -383,6 +472,8 @@ export default function App() {
         maintenanceType: m.maintenance_type,
         notes: m.service_description || 'Inspection / repair required',
         scheduledDate: m.scheduled_date,
+        totalCost: Number(m.total_maintenance_cost || 0),
+        tasks: m.tasks || [],
         status: m.maintenance_status,
       });
     }
@@ -397,9 +488,11 @@ export default function App() {
           equipmentId: eq.id,
           equipmentName: eq.model_name,
           serialNumber: eq.serial_number,
-          maintenanceType: 'corrective',
+          maintenanceType: 'scheduled_routine',
           notes: 'Marked Under Maintenance — ready to verify & restore',
           scheduledDate: todayDate,
+          totalCost: 0,
+          tasks: [],
           status: 'pending',
         });
       }
@@ -912,13 +1005,275 @@ export default function App() {
     const busyKey = maintenanceId || equipmentId;
     setMaintenanceUpdatingId(busyKey);
     try {
-      await completeMaintenanceRepair({ maintenanceId, equipmentId });
+      await completeMaintenanceRepair({
+        maintenanceId,
+        equipmentId,
+        technicianId: currentUser?.id,
+      });
       showToast('Equipment marked as Repaired and automatically set to Available in Inventory!');
       await reloadData();
     } catch (err: unknown) {
       showToast(err instanceof Error ? err.message : 'Could not mark equipment as repaired.');
     } finally {
       setMaintenanceUpdatingId(null);
+    }
+  };
+
+  // 6c. Send Available Equipment to Maintenance (creates maintenance_records + maintenance_tasks + updates equipment)
+  const handleSendToMaintenanceSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!maintTargetEquip || !currentUser) return;
+    setMaintSaving(true);
+    try {
+      await sendEquipmentToMaintenance({
+        equipmentId: maintTargetEquip.id,
+        technicianId: currentUser.id,
+        maintenanceType: maintType,
+        description: maintDesc || 'Scheduled equipment inspection & calibration',
+        taskName: maintTaskName || 'Diagnostic Inspection & Calibration',
+        hoursLogged: Number(maintHours) || 1,
+        hourlyLaborRate: Number(maintHourlyRate) || 500,
+      });
+      showToast(
+        `${maintTargetEquip.model_name} sent to Maintenance — saved in equipment, maintenance_records, and maintenance_tasks!`
+      );
+      setMaintTargetEquip(null);
+      setMaintDesc('');
+      await reloadData();
+    } catch (err: unknown) {
+      showToast(err instanceof Error ? err.message : 'Could not send equipment to maintenance.');
+    } finally {
+      setMaintSaving(false);
+    }
+  };
+
+  // 6d. Maintenance Tasks CRUD (maintenance_tasks <-> maintenance_records cost sync)
+  const handleAddMaintTaskSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!managingMaintId || !currentUser) return;
+    setTaskSaving(true);
+    try {
+      if (!newTaskName.trim()) {
+        throw new Error('Enter a repair task name.');
+      }
+      await addMaintenanceTask({
+        maintenanceId: managingMaintId,
+        technicianId: currentUser.id,
+        taskName: newTaskName.trim(),
+        hoursLogged: Number(newTaskHours) || 1,
+        hourlyLaborRate: Number(newTaskRate) || 500,
+        findingsReport: newTaskReport.trim() || undefined,
+      });
+      showToast('Repair task saved in maintenance_tasks and work order cost synced!');
+      setNewTaskName('');
+      setNewTaskHours('1');
+      setNewTaskReport('');
+      await reloadData();
+    } catch (err: unknown) {
+      showToast(err instanceof Error ? err.message : 'Could not add maintenance task.');
+    } finally {
+      setTaskSaving(false);
+    }
+  };
+
+  const handleRemoveMaintTask = async (taskId: string, maintenanceId: string) => {
+    try {
+      await deleteMaintenanceTask({ taskId, maintenanceId });
+      showToast('Task removed from maintenance_tasks and work order cost recalculated.');
+      await reloadData();
+    } catch (err: unknown) {
+      showToast(err instanceof Error ? err.message : 'Could not delete maintenance task.');
+    }
+  };
+
+  // 6e. Order Items CRUD (rental_order_items <-> rental_orders totals sync)
+  const openManageOrderItems = (order: RentalOrder) => {
+    const drafts: Record<string, { rate: string; days: string }> = {};
+    for (const item of order.items || []) {
+      drafts[item.id] = {
+        rate: String(item.unit_daily_rate),
+        days: String(item.days_rented),
+      };
+    }
+    setItemEditDrafts(drafts);
+    const existingIds = new Set((order.items || []).map((i) => i.equipment_id));
+    const candidate =
+      availableEquipment.find((eq) => !existingIds.has(eq.id)) || availableEquipment[0];
+    setNewOrderItemEquipId(candidate?.id || '');
+    setNewOrderItemRate(candidate ? String(candidate.daily_rental_rate) : '');
+    setNewOrderItemDays(String(order.items?.[0]?.days_rented || 1));
+    setManagingOrderId(order.id);
+  };
+
+  const handleSaveOrderItemEdit = async (
+    order: RentalOrder,
+    itemId: string
+  ) => {
+    const draft = itemEditDrafts[itemId];
+    if (!draft) return;
+    setOrderItemSaving(true);
+    try {
+      await updateOrderItem({
+        itemId,
+        orderId: order.id,
+        unitDailyRate: Number(draft.rate),
+        daysRented: Number(draft.days),
+        orderStartDate: order.expected_start_date,
+      });
+      showToast('Order item updated in rental_order_items and order total recalculated!');
+      await reloadData();
+    } catch (err: unknown) {
+      showToast(err instanceof Error ? err.message : 'Could not update order item.');
+    } finally {
+      setOrderItemSaving(false);
+    }
+  };
+
+  const handleAddOrderItemSubmit = async (e: React.FormEvent, order: RentalOrder) => {
+    e.preventDefault();
+    if (!newOrderItemEquipId) {
+      showToast('Select an available equipment unit to add.');
+      return;
+    }
+    setOrderItemSaving(true);
+    try {
+      const equip = equipmentList.find((eq) => eq.id === newOrderItemEquipId);
+      const rate = Number(newOrderItemRate) || equip?.daily_rental_rate || 1000;
+      const days = Math.max(1, Number(newOrderItemDays) || 1);
+      const insRate = equip?.category?.base_daily_insurance_rate ?? 0;
+
+      const added = await addOrderItem({
+        orderId: order.id,
+        equipmentId: newOrderItemEquipId,
+        unitDailyRate: rate,
+        dailyInsuranceRate: insRate,
+        daysRented: days,
+      });
+      setItemEditDrafts((prev) => ({
+        ...prev,
+        [added.id]: { rate: String(added.unit_daily_rate), days: String(added.days_rented) },
+      }));
+      showToast('Item added to rental_order_items and rental_orders total updated!');
+      await reloadData();
+    } catch (err: unknown) {
+      showToast(err instanceof Error ? err.message : 'Could not add item to order.');
+    } finally {
+      setOrderItemSaving(false);
+    }
+  };
+
+  const handleRemoveOrderItem = async (orderId: string, itemId: string) => {
+    if (!window.confirm('Remove this equipment item from the rental order?')) {
+      return;
+    }
+    setOrderItemSaving(true);
+    try {
+      const res = await deleteOrderItem({ itemId, orderId });
+      if (res.orderDeletedOrCancelled) {
+        setManagingOrderId(null);
+        showToast('Last item removed — empty order was automatically removed/cancelled.');
+      } else {
+        showToast('Item deleted from rental_order_items and order total recalculated!');
+      }
+      await reloadData();
+    } catch (err: unknown) {
+      showToast(err instanceof Error ? err.message : 'Could not remove item from order.');
+    } finally {
+      setOrderItemSaving(false);
+    }
+  };
+
+  // 6f. Payment Recording (payment_transactions <-> rental_orders.payment_status sync)
+  const handleRecordPaymentSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!payingOrder || !currentUser) return;
+    setPaymentSaving(true);
+    try {
+      await recordOrderPayment({
+        orderId: payingOrder.id,
+        amount: Number(paymentAmount),
+        paymentMethod,
+        processedBy: currentUser.id,
+      });
+      showToast(
+        `Payment recorded in payment_transactions and ${payingOrder.order_number} payment status synced!`
+      );
+      setPayingOrder(null);
+      await reloadData();
+    } catch (err: unknown) {
+      showToast(err instanceof Error ? err.message : 'Could not record payment.');
+    } finally {
+      setPaymentSaving(false);
+    }
+  };
+
+  // 6g. Admin Categories & Studio Branches CRUD (equipment_categories & warehouse_locations)
+  const handleCreateCategorySubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    try {
+      if (!catName.trim() || !catCode.trim()) {
+        throw new Error('Category Name and Code are required.');
+      }
+      await createEquipmentCategory({
+        category_name: catName,
+        category_code: catCode,
+        description: catDesc,
+        base_daily_insurance_rate: Number(catInsuranceRate) || 0,
+      });
+      showToast(`Category "${catName}" saved to equipment_categories!`);
+      setCatName('');
+      setCatCode('');
+      setCatDesc('');
+      await reloadData();
+    } catch (err: unknown) {
+      showToast(err instanceof Error ? err.message : 'Could not create category.');
+    }
+  };
+
+  const handleDeleteCategory = async (id: string, name: string) => {
+    if (!window.confirm(`Delete category "${name}" from equipment_categories?`)) return;
+    try {
+      await deleteEquipmentCategory(id);
+      showToast(`Category "${name}" deleted from equipment_categories.`);
+      await reloadData();
+    } catch (err: unknown) {
+      showToast(err instanceof Error ? err.message : 'Could not delete category.');
+    }
+  };
+
+  const handleCreateWarehouseSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    try {
+      if (!whCode.trim() || !whName.trim() || !whAddress.trim()) {
+        throw new Error('Branch Code, Name, and Address are required.');
+      }
+      await createWarehouse({
+        branch_code: whCode,
+        branch_name: whName,
+        address: whAddress,
+        city: whCity || 'Quezon City',
+        region: whRegion || 'NCR',
+        contact_phone: formatPhilippinePhone(whPhone),
+        max_storage_capacity: Number(whCapacity) || 100,
+      });
+      showToast(`Branch "${whName}" saved to warehouse_locations!`);
+      setWhCode('');
+      setWhName('');
+      setWhAddress('');
+      await reloadData();
+    } catch (err: unknown) {
+      showToast(err instanceof Error ? err.message : 'Could not create branch.');
+    }
+  };
+
+  const handleDeleteWarehouse = async (id: string, name: string) => {
+    if (!window.confirm(`Delete branch "${name}" from warehouse_locations?`)) return;
+    try {
+      await deleteWarehouse(id);
+      showToast(`Branch "${name}" deleted from warehouse_locations.`);
+      await reloadData();
+    } catch (err: unknown) {
+      showToast(err instanceof Error ? err.message : 'Could not delete branch.');
     }
   };
 
@@ -1619,13 +1974,31 @@ export default function App() {
 
                 <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', alignItems: 'center' }}>
                   {currentRole === 'admin' && (
-                    <button
-                      className="primary-purple-btn"
-                      onClick={() => setIsAddEquipmentOpen(true)}
-                      style={{ padding: '8px 16px', fontSize: 12 }}
-                    >
-                      + Add Equipment
-                    </button>
+                    <>
+                      <button
+                        className="primary-purple-btn"
+                        onClick={() => setIsAddEquipmentOpen(true)}
+                        style={{ padding: '8px 16px', fontSize: 12 }}
+                      >
+                        + Add Equipment
+                      </button>
+                      <button
+                        type="button"
+                        className="outline-pill-btn"
+                        onClick={() => setIsManageCategoriesOpen(true)}
+                        style={{ padding: '8px 12px', fontSize: 12 }}
+                      >
+                        Categories ({categoriesList.length})
+                      </button>
+                      <button
+                        type="button"
+                        className="outline-pill-btn"
+                        onClick={() => setIsManageWarehousesOpen(true)}
+                        style={{ padding: '8px 12px', fontSize: 12 }}
+                      >
+                        Branches ({warehousesList.length})
+                      </button>
+                    </>
                   )}
 
                   <input
@@ -1741,12 +2114,28 @@ export default function App() {
 
                           {currentRole === 'staff' && (
                             item.current_status === 'available' ? (
-                              <button
-                                className="reserve-purple-btn"
-                                onClick={() => openBookingModal(item)}
-                              >
-                                Rent for Customer
-                              </button>
+                              <>
+                                <button
+                                  className="reserve-purple-btn"
+                                  onClick={() => openBookingModal(item)}
+                                >
+                                  Rent for Customer
+                                </button>
+                                <button
+                                  type="button"
+                                  className="outline-pill-btn"
+                                  style={{ padding: '6px 10px', fontSize: 11 }}
+                                  onClick={() => {
+                                    setMaintTargetEquip(item);
+                                    setMaintType('scheduled_routine');
+                                    setMaintDesc('');
+                                    setMaintTaskName('Diagnostic Inspection & Calibration');
+                                  }}
+                                  title="Log a maintenance work order & repair task in Supabase"
+                                >
+                                  🔧 Maintenance
+                                </button>
+                              </>
                             ) : item.current_status === 'under_maintenance' ? (
                               <button
                                 type="button"
@@ -1776,6 +2165,22 @@ export default function App() {
 
                           {currentRole === 'admin' && (
                             <div className="crud-btn-group">
+                              {item.current_status === 'available' && (
+                                <button
+                                  type="button"
+                                  className="outline-pill-btn"
+                                  style={{ padding: '5px 8px', fontSize: 11 }}
+                                  onClick={() => {
+                                    setMaintTargetEquip(item);
+                                    setMaintType('scheduled_routine');
+                                    setMaintDesc('');
+                                    setMaintTaskName('Diagnostic Inspection & Calibration');
+                                  }}
+                                  title="Send to Maintenance (creates maintenance_records + maintenance_tasks)"
+                                >
+                                  🔧 Service
+                                </button>
+                              )}
                               <button
                                 className="edit-action-btn"
                                 onClick={() => {
@@ -2048,7 +2453,7 @@ export default function App() {
                   <tbody>
                     {orders.map((o) => {
                       const totalDue = getOrderTotal(o);
-                      const equipName = o.items?.[0]?.equipment?.model_name || 'Equipment';
+                      const equipName = formatOrderEquipmentLabel(o);
                       return (
                         <tr key={o.id}>
                           <td>
@@ -2196,7 +2601,8 @@ export default function App() {
                   <tbody>
                     {filteredStaffOrders.map((ord) => {
                       const totalDue = getOrderTotal(ord);
-                      const equipName = ord.items?.[0]?.equipment?.model_name || 'Equipment';
+                      const equipName = formatOrderEquipmentLabel(ord);
+                      const canEditItems = ord.status === 'draft' || ord.status === 'confirmed';
                       return (
                         <tr key={ord.id}>
                           <td>
@@ -2212,7 +2618,20 @@ export default function App() {
                                 : ord.special_terms || 'No phone'}
                             </small>
                           </td>
-                          <td>{equipName}</td>
+                          <td>
+                            <div>{equipName}</div>
+                            {canEditItems && (
+                              <button
+                                type="button"
+                                className="outline-pill-btn"
+                                style={{ padding: '3px 8px', fontSize: 10, marginTop: 4 }}
+                                onClick={() => openManageOrderItems(ord)}
+                                title="Edit item price/days, add items, or remove items in rental_order_items"
+                              >
+                                📋 Manage Items ({ord.items?.length || 0})
+                              </button>
+                            )}
+                          </td>
                           <td>
                             <div>
                               {ord.expected_start_date} &rarr; {ord.expected_end_date}
@@ -2223,8 +2642,24 @@ export default function App() {
                               </small>
                             )}
                           </td>
-                          <td style={{ fontWeight: 800, color: 'var(--purple-main)' }}>
-                            {formatPHP(totalDue)}
+                          <td>
+                            <div style={{ fontWeight: 800, color: 'var(--purple-main)' }}>
+                              {formatPHP(totalDue)}
+                            </div>
+                            <small
+                              style={{
+                                fontSize: 10,
+                                fontWeight: 700,
+                                color:
+                                  ord.payment_status === 'paid'
+                                    ? '#047857'
+                                    : ord.payment_status === 'partially_paid'
+                                      ? '#b45309'
+                                      : '#6b7280',
+                              }}
+                            >
+                              {ord.payment_status.toUpperCase()}
+                            </small>
                           </td>
                           <td>
                             {ord.status === 'draft' ? (
@@ -2241,6 +2676,21 @@ export default function App() {
                           </td>
                           <td>
                             <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
+                              {ord.status !== 'cancelled' && ord.payment_status !== 'paid' && (
+                                <button
+                                  type="button"
+                                  className="outline-pill-btn"
+                                  style={{ padding: '4px 10px', fontSize: 11 }}
+                                  onClick={() => {
+                                    setPayingOrder(ord);
+                                    setPaymentAmount(String(totalDue));
+                                    setPaymentMethod('cash');
+                                  }}
+                                  title="Record payment in payment_transactions"
+                                >
+                                  💳 Pay
+                                </button>
+                              )}
                               {ord.status === 'draft' ? (
                                 <>
                                   <button
@@ -2360,7 +2810,7 @@ export default function App() {
                       })
                       .map((ord) => {
                         const isExpired = ord.status === 'confirmed' && ord.expected_end_date < todayDate;
-                        const equipLabel = ord.items?.[0]?.equipment?.model_name || 'Equipment';
+                        const equipLabel = formatOrderEquipmentLabel(ord);
                         return (
                           <tr key={ord.id}>
                             <td>
@@ -2573,6 +3023,52 @@ export default function App() {
                   </tbody>
                 </table>
               </div>
+
+              {inspections.length > 0 && (
+                <div style={{ marginTop: 22, borderTop: '1px solid var(--border-subtle)', paddingTop: 16 }}>
+                  <h4 style={{ margin: '0 0 10px', fontSize: 14, fontWeight: 800, color: '#111827' }}>
+                    Saved Check-In Inspection Records ({inspections.length})
+                  </h4>
+                  <div className="table-responsive">
+                    <table className="finset-table">
+                      <thead>
+                        <tr>
+                          <th>INSPECTION ID</th>
+                          <th>INSPECTOR</th>
+                          <th>CLEANLINESS</th>
+                          <th>INTEGRITY</th>
+                          <th>RESULT</th>
+                          <th>PENALTY</th>
+                          <th>NOTES</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {inspections.slice(0, 12).map((ins) => (
+                          <tr key={ins.id}>
+                            <td>
+                              <code>{ins.id.slice(0, 8)}</code>
+                            </td>
+                            <td>{ins.inspector?.full_name || 'Staff'}</td>
+                            <td>{ins.cleanliness_rating}/5</td>
+                            <td>{ins.structural_integrity_rating}/5</td>
+                            <td>
+                              {ins.damage_identified ? (
+                                <span className="cancelled-status-badge">Damaged</span>
+                              ) : (
+                                <span className="confirmed-status-badge">Okay</span>
+                              )}
+                            </td>
+                            <td>{formatPHP(ins.penalty_fee)}</td>
+                            <td style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                              {ins.damage_assessment_notes || 'Clean check-in'}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
             </div>
           )}
 
@@ -2583,7 +3079,7 @@ export default function App() {
                 <div>
                   <h3 className="chart-card-title">Borrowed & Returned Equipment Tracking</h3>
                 </div>
-                <div style={{ display: 'flex', gap: 8 }}>
+                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
                   <button
                     className={`auth-tab-btn-finset ${adminBorrowedTab === 'borrowed' ? 'active' : ''}`}
                     style={{ padding: '6px 14px', fontSize: 12, borderRadius: 20 }}
@@ -2598,10 +3094,151 @@ export default function App() {
                   >
                     Returned Items ({returnedItems.length})
                   </button>
+                  <button
+                    className={`auth-tab-btn-finset ${adminBorrowedTab === 'orders' ? 'active' : ''}`}
+                    style={{ padding: '6px 14px', fontSize: 12, borderRadius: 20 }}
+                    onClick={() => setAdminBorrowedTab('orders')}
+                  >
+                    Orders &amp; Payments ({orders.length})
+                  </button>
                 </div>
               </div>
 
-              {adminBorrowedTab === 'borrowed' ? (
+              {adminBorrowedTab === 'orders' ? (
+                <div>
+                  <div className="table-responsive">
+                    <table className="finset-table">
+                      <thead>
+                        <tr>
+                          <th>ORDER #</th>
+                          <th>CUSTOMER</th>
+                          <th>ORDER ITEMS</th>
+                          <th>DATES</th>
+                          <th>TOTAL DUE</th>
+                          <th>PAYMENT</th>
+                          <th>STATUS</th>
+                          <th>ACTIONS</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {orders.map((ord) => {
+                          const totalDue = getOrderTotal(ord);
+                          const canEditItems = ord.status === 'draft' || ord.status === 'confirmed';
+                          return (
+                            <tr key={ord.id}>
+                              <td>
+                                <strong>{ord.order_number}</strong>
+                              </td>
+                              <td>{ord.customer?.full_name || 'Customer'}</td>
+                              <td>{formatOrderEquipmentLabel(ord)}</td>
+                              <td>
+                                {ord.expected_start_date} &rarr; {ord.expected_end_date}
+                              </td>
+                              <td style={{ fontWeight: 800, color: 'var(--purple-main)' }}>
+                                {formatPHP(totalDue)}
+                              </td>
+                              <td>
+                                <span
+                                  className={
+                                    ord.payment_status === 'paid'
+                                      ? 'confirmed-status-badge'
+                                      : 'pending-status-badge'
+                                  }
+                                >
+                                  {ord.payment_status.toUpperCase()}
+                                </span>
+                              </td>
+                              <td>
+                                {ord.status === 'completed' ? (
+                                  <span className="completed-status-badge">✓ Completed</span>
+                                ) : ord.status === 'in_progress' ? (
+                                  <span className="in-progress-status-badge">Dispatched</span>
+                                ) : ord.status === 'confirmed' ? (
+                                  <span className="confirmed-status-badge">Confirmed</span>
+                                ) : ord.status === 'draft' ? (
+                                  <span className="pending-status-badge">Pending</span>
+                                ) : (
+                                  <span className="cancelled-status-badge">Cancelled</span>
+                                )}
+                              </td>
+                              <td>
+                                <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                                  {canEditItems && (
+                                    <button
+                                      type="button"
+                                      className="outline-pill-btn"
+                                      style={{ padding: '4px 10px', fontSize: 11 }}
+                                      onClick={() => openManageOrderItems(ord)}
+                                    >
+                                      📋 Items ({ord.items?.length || 0})
+                                    </button>
+                                  )}
+                                  {ord.status !== 'cancelled' && ord.payment_status !== 'paid' && (
+                                    <button
+                                      type="button"
+                                      className="outline-pill-btn"
+                                      style={{ padding: '4px 10px', fontSize: 11 }}
+                                      onClick={() => {
+                                        setPayingOrder(ord);
+                                        setPaymentAmount(String(totalDue));
+                                        setPaymentMethod('cash');
+                                      }}
+                                    >
+                                      💳 Record Payment
+                                    </button>
+                                  )}
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+
+                  {payments.length > 0 && (
+                    <div style={{ marginTop: 22, borderTop: '1px solid var(--border-subtle)', paddingTop: 16 }}>
+                      <h4 style={{ margin: '0 0 10px', fontSize: 14, fontWeight: 800, color: '#111827' }}>
+                        Payment Transactions Ledger ({payments.length})
+                      </h4>
+                      <div className="table-responsive">
+                        <table className="finset-table">
+                          <thead>
+                            <tr>
+                              <th>REFERENCE</th>
+                              <th>METHOD</th>
+                              <th>AMOUNT</th>
+                              <th>STATUS</th>
+                              <th>PROCESSED AT</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {payments.slice(0, 15).map((pt) => (
+                              <tr key={pt.id}>
+                                <td>
+                                  <code>{pt.transaction_reference}</code>
+                                </td>
+                                <td style={{ textTransform: 'uppercase', fontSize: 11, fontWeight: 700 }}>
+                                  {pt.payment_method.replace('_', ' ')}
+                                </td>
+                                <td style={{ fontWeight: 800, color: '#047857' }}>
+                                  {formatPHP(pt.amount)}
+                                </td>
+                                <td>
+                                  <span className="confirmed-status-badge">
+                                    {pt.transaction_status}
+                                  </span>
+                                </td>
+                                <td>{new Date(pt.processed_at).toLocaleString()}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              ) : adminBorrowedTab === 'borrowed' ? (
                 <div className="table-responsive">
                   <table className="finset-table">
                     <thead>
@@ -2844,6 +3481,7 @@ export default function App() {
                       <th>EQUIPMENT</th>
                       <th>SERIAL #</th>
                       <th>ISSUE / NOTES</th>
+                      <th>TASKS &amp; COST</th>
                       <th>DATE</th>
                       <th>STATUS</th>
                       <th>ACTION</th>
@@ -2865,7 +3503,23 @@ export default function App() {
                           <td>
                             <code>{m.serialNumber}</code>
                           </td>
-                          <td style={{ maxWidth: 260, fontSize: 12, color: '#374151' }}>{m.notes}</td>
+                          <td style={{ maxWidth: 240, fontSize: 12, color: '#374151' }}>{m.notes}</td>
+                          <td>
+                            <div style={{ fontWeight: 700, fontSize: 12 }}>
+                              {formatPHP(m.totalCost)}
+                            </div>
+                            {m.maintenanceId && (
+                              <button
+                                type="button"
+                                className="outline-pill-btn"
+                                style={{ padding: '3px 8px', fontSize: 10, marginTop: 3 }}
+                                onClick={() => setManagingMaintId(m.maintenanceId!)}
+                                title="View, add, or remove technician tasks in maintenance_tasks"
+                              >
+                                📋 Tasks ({m.tasks.length})
+                              </button>
+                            )}
+                          </td>
                           <td>{m.scheduledDate}</td>
                           <td>
                             {isOpen ? (
@@ -2899,7 +3553,7 @@ export default function App() {
                     })}
                     {maintenanceQueueItems.length === 0 && (
                       <tr>
-                        <td colSpan={7} style={{ textAlign: 'center', padding: 30, color: 'var(--text-muted)' }}>
+                        <td colSpan={8} style={{ textAlign: 'center', padding: 30, color: 'var(--text-muted)' }}>
                           No equipment is currently under maintenance.
                         </td>
                       </tr>
@@ -3898,6 +4552,39 @@ export default function App() {
                 </div>
               </div>
 
+              <div className="form-row">
+                <div className="form-group">
+                  <label>Category</label>
+                  <select
+                    className="filter-select-pill"
+                    style={{ width: '100%', borderRadius: 12, padding: 10 }}
+                    value={eqCategoryId}
+                    onChange={(e) => setEqCategoryId(e.target.value)}
+                  >
+                    {categoriesList.map((c) => (
+                      <option key={c.id} value={c.id}>
+                        {c.category_name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="form-group">
+                  <label>Pickup Hub / Studio Branch</label>
+                  <select
+                    className="filter-select-pill"
+                    style={{ width: '100%', borderRadius: 12, padding: 10 }}
+                    value={eqWarehouseId}
+                    onChange={(e) => setEqWarehouseId(e.target.value)}
+                  >
+                    {warehousesList.map((w) => (
+                      <option key={w.id} value={w.id}>
+                        {w.branch_name} ({w.city})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+
               <div className="form-group">
                 <label>Image URL</label>
                 <input
@@ -4011,6 +4698,839 @@ export default function App() {
                 </button>
                 <button type="submit" className="primary-purple-btn" disabled={staffSaving}>
                   {staffSaving ? 'Creating Staff Member...' : 'Create Staff Account'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL 6: MANAGE RENTAL ORDER ITEMS (rental_order_items <-> rental_orders LIVE SYNC) */}
+      {managingOrderId &&
+        (() => {
+          const targetOrd = orders.find((o) => o.id === managingOrderId);
+          if (!targetOrd) return null;
+          const existingEquipIds = new Set((targetOrd.items || []).map((i) => i.equipment_id));
+          return (
+            <div
+              style={{
+                position: 'fixed',
+                inset: 0,
+                background: 'rgba(30, 20, 60, 0.45)',
+                backdropFilter: 'blur(6px)',
+                display: 'grid',
+                placeItems: 'center',
+                zIndex: 1000,
+                padding: 18,
+              }}
+            >
+              <div
+                style={{
+                  background: '#ffffff',
+                  borderRadius: 28,
+                  padding: 28,
+                  maxWidth: 680,
+                  width: '100%',
+                  maxHeight: '88vh',
+                  overflowY: 'auto',
+                  boxShadow: '0 25px 70px rgba(0,0,0,0.22)',
+                }}
+              >
+                <h2 style={{ fontSize: 20, fontWeight: 800, margin: '0 0 4px', color: '#111827' }}>
+                  Manage Order Items — {targetOrd.order_number}
+                </h2>
+                <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: '0 0 16px' }}>
+                  Changes save directly to <code>rental_order_items</code> and automatically recalculate{' '}
+                  <code>rental_orders</code> totals ({formatPHP(getOrderTotal(targetOrd))}).
+                </p>
+
+                <div className="table-responsive" style={{ marginBottom: 18 }}>
+                  <table className="finset-table">
+                    <thead>
+                      <tr>
+                        <th>EQUIPMENT</th>
+                        <th>RATE / DAY (PHP)</th>
+                        <th>DAYS</th>
+                        <th>SUBTOTAL</th>
+                        <th>ACTIONS</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {(targetOrd.items || []).map((item) => {
+                        const draft = itemEditDrafts[item.id] || {
+                          rate: String(item.unit_daily_rate),
+                          days: String(item.days_rented),
+                        };
+                        const previewSub =
+                          (Number(draft.rate) || 0) * Math.max(1, Number(draft.days) || 1);
+                        return (
+                          <tr key={item.id}>
+                            <td>
+                              <strong>{item.equipment?.model_name || 'Equipment'}</strong>
+                            </td>
+                            <td>
+                              <input
+                                type="number"
+                                min="1"
+                                step="0.01"
+                                value={draft.rate}
+                                onChange={(e) =>
+                                  setItemEditDrafts((prev) => ({
+                                    ...prev,
+                                    [item.id]: { ...draft, rate: e.target.value },
+                                  }))
+                                }
+                                style={{
+                                  width: 100,
+                                  padding: '5px 8px',
+                                  borderRadius: 8,
+                                  border: '1px solid var(--border-subtle)',
+                                  fontSize: 12,
+                                }}
+                              />
+                            </td>
+                            <td>
+                              <input
+                                type="number"
+                                min="1"
+                                max="30"
+                                value={draft.days}
+                                onChange={(e) =>
+                                  setItemEditDrafts((prev) => ({
+                                    ...prev,
+                                    [item.id]: { ...draft, days: e.target.value },
+                                  }))
+                                }
+                                style={{
+                                  width: 64,
+                                  padding: '5px 8px',
+                                  borderRadius: 8,
+                                  border: '1px solid var(--border-subtle)',
+                                  fontSize: 12,
+                                }}
+                              />
+                            </td>
+                            <td style={{ fontWeight: 700 }}>{formatPHP(previewSub)}</td>
+                            <td>
+                              <div style={{ display: 'flex', gap: 6 }}>
+                                <button
+                                  type="button"
+                                  className="approve-btn"
+                                  style={{ padding: '4px 10px', fontSize: 11 }}
+                                  disabled={orderItemSaving}
+                                  onClick={() => handleSaveOrderItemEdit(targetOrd, item.id)}
+                                >
+                                  Save
+                                </button>
+                                <button
+                                  type="button"
+                                  className="delete-action-btn"
+                                  style={{ padding: '4px 10px', fontSize: 11 }}
+                                  disabled={orderItemSaving}
+                                  onClick={() => handleRemoveOrderItem(targetOrd.id, item.id)}
+                                >
+                                  Delete
+                                </button>
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+
+                <form
+                  onSubmit={(e) => handleAddOrderItemSubmit(e, targetOrd)}
+                  className="auth-form-finset"
+                  style={{
+                    background: '#fafaff',
+                    border: '1px solid var(--border-subtle)',
+                    borderRadius: 16,
+                    padding: 16,
+                  }}
+                >
+                  <h4 style={{ margin: '0 0 10px', fontSize: 13, fontWeight: 800, color: '#111827' }}>
+                    + Add Equipment Item to Order
+                  </h4>
+                  <div className="form-row">
+                    <div className="form-group">
+                      <label>Available Equipment</label>
+                      <select
+                        className="filter-select-pill"
+                        style={{ width: '100%', borderRadius: 12, padding: 8 }}
+                        value={newOrderItemEquipId}
+                        onChange={(e) => {
+                          const id = e.target.value;
+                          setNewOrderItemEquipId(id);
+                          const eq = availableEquipment.find((x) => x.id === id);
+                          if (eq) setNewOrderItemRate(String(eq.daily_rental_rate));
+                        }}
+                      >
+                        <option value="">-- Select equipment --</option>
+                        {availableEquipment
+                          .filter((eq) => !existingEquipIds.has(eq.id))
+                          .map((eq) => (
+                            <option key={eq.id} value={eq.id}>
+                              {eq.model_name} ({formatPHP(eq.daily_rental_rate)}/day)
+                            </option>
+                          ))}
+                      </select>
+                    </div>
+                    <div className="form-group">
+                      <label>Rate / Day (PHP)</label>
+                      <input
+                        type="number"
+                        min="1"
+                        step="0.01"
+                        value={newOrderItemRate}
+                        onChange={(e) => setNewOrderItemRate(e.target.value)}
+                        required
+                      />
+                    </div>
+                    <div className="form-group">
+                      <label>Days</label>
+                      <input
+                        type="number"
+                        min="1"
+                        max="30"
+                        value={newOrderItemDays}
+                        onChange={(e) => setNewOrderItemDays(e.target.value)}
+                        required
+                      />
+                    </div>
+                  </div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 10 }}>
+                    <button
+                      type="button"
+                      className="outline-pill-btn"
+                      onClick={() => setManagingOrderId(null)}
+                    >
+                      Close
+                    </button>
+                    <button
+                      type="submit"
+                      className="primary-purple-btn"
+                      disabled={orderItemSaving || !newOrderItemEquipId}
+                    >
+                      + Add Item to Order
+                    </button>
+                  </div>
+                </form>
+              </div>
+            </div>
+          );
+        })()}
+
+      {/* MODAL 7: RECORD PAYMENT TRANSACTION (payment_transactions <-> rental_orders.payment_status) */}
+      {payingOrder && (
+        <div
+          style={{
+            position: 'fixed',
+            inset: 0,
+            background: 'rgba(30, 20, 60, 0.45)',
+            backdropFilter: 'blur(6px)',
+            display: 'grid',
+            placeItems: 'center',
+            zIndex: 1000,
+            padding: 18,
+          }}
+        >
+          <div
+            style={{
+              background: '#ffffff',
+              borderRadius: 28,
+              padding: 28,
+              maxWidth: 460,
+              width: '100%',
+              boxShadow: '0 25px 70px rgba(0,0,0,0.22)',
+            }}
+          >
+            <h2 style={{ fontSize: 20, fontWeight: 800, margin: '0 0 4px', color: '#111827' }}>
+              Record Order Payment
+            </h2>
+            <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: '0 0 16px' }}>
+              {payingOrder.order_number} &bull; Total Due: {formatPHP(getOrderTotal(payingOrder))}
+            </p>
+            <form onSubmit={handleRecordPaymentSubmit} className="auth-form-finset">
+              <div className="form-group">
+                <label>Payment Method</label>
+                <select
+                  className="filter-select-pill"
+                  style={{ width: '100%', borderRadius: 12, padding: 10 }}
+                  value={paymentMethod}
+                  onChange={(e) => setPaymentMethod(e.target.value as PaymentMethod)}
+                >
+                  <option value="cash">Cash</option>
+                  <option value="credit_card">Credit Card</option>
+                  <option value="bank_transfer">Bank Transfer</option>
+                  <option value="corporate_credit">Corporate Credit</option>
+                </select>
+              </div>
+              <div className="form-group">
+                <label>Amount Paid (PHP)</label>
+                <input
+                  type="number"
+                  min="1"
+                  step="0.01"
+                  value={paymentAmount}
+                  onChange={(e) => setPaymentAmount(e.target.value)}
+                  required
+                />
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, marginTop: 14 }}>
+                <button
+                  type="button"
+                  className="outline-pill-btn"
+                  onClick={() => setPayingOrder(null)}
+                >
+                  Cancel
+                </button>
+                <button type="submit" className="primary-purple-btn" disabled={paymentSaving}>
+                  {paymentSaving ? 'Recording...' : 'Save Payment'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL 8: SEND EQUIPMENT TO MAINTENANCE (equipment + maintenance_records + maintenance_tasks) */}
+      {maintTargetEquip && (
+        <div
+          style={{
+            position: 'fixed',
+            inset: 0,
+            background: 'rgba(30, 20, 60, 0.45)',
+            backdropFilter: 'blur(6px)',
+            display: 'grid',
+            placeItems: 'center',
+            zIndex: 1000,
+            padding: 18,
+          }}
+        >
+          <div
+            style={{
+              background: '#ffffff',
+              borderRadius: 28,
+              padding: 28,
+              maxWidth: 500,
+              width: '100%',
+              boxShadow: '0 25px 70px rgba(0,0,0,0.22)',
+            }}
+          >
+            <h2 style={{ fontSize: 20, fontWeight: 800, margin: '0 0 4px', color: '#111827' }}>
+              Log Maintenance Work Order
+            </h2>
+            <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: '0 0 16px' }}>
+              {maintTargetEquip.model_name} (S/N: {maintTargetEquip.serial_number})
+            </p>
+            <form onSubmit={handleSendToMaintenanceSubmit} className="auth-form-finset">
+              <div className="form-group">
+                <label>Maintenance Type</label>
+                <select
+                  className="filter-select-pill"
+                  style={{ width: '100%', borderRadius: 12, padding: 10 }}
+                  value={maintType}
+                  onChange={(e) => setMaintType(e.target.value as MaintenanceType)}
+                >
+                  <option value="scheduled_routine">Scheduled Routine Calibration</option>
+                  <option value="emergency_repair">Emergency Repair</option>
+                  <option value="post_rental_inspection">Post-Rental Inspection</option>
+                  <option value="major_overhaul">Major Overhaul</option>
+                </select>
+              </div>
+              <div className="form-group">
+                <label>Service / Issue Description</label>
+                <input
+                  type="text"
+                  required
+                  placeholder="e.g. Sensor cleaning & shutter calibration"
+                  value={maintDesc}
+                  onChange={(e) => setMaintDesc(e.target.value)}
+                />
+              </div>
+              <div className="form-group">
+                <label>Initial Repair Task Name</label>
+                <input
+                  type="text"
+                  required
+                  value={maintTaskName}
+                  onChange={(e) => setMaintTaskName(e.target.value)}
+                />
+              </div>
+              <div className="form-row">
+                <div className="form-group">
+                  <label>Estimated Hours</label>
+                  <input
+                    type="number"
+                    min="0.5"
+                    step="0.5"
+                    value={maintHours}
+                    onChange={(e) => setMaintHours(e.target.value)}
+                    required
+                  />
+                </div>
+                <div className="form-group">
+                  <label>Hourly Labor Rate (PHP)</label>
+                  <input
+                    type="number"
+                    min="1"
+                    step="0.01"
+                    value={maintHourlyRate}
+                    onChange={(e) => setMaintHourlyRate(e.target.value)}
+                    required
+                  />
+                </div>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, marginTop: 14 }}>
+                <button
+                  type="button"
+                  className="outline-pill-btn"
+                  onClick={() => setMaintTargetEquip(null)}
+                >
+                  Cancel
+                </button>
+                <button type="submit" className="primary-purple-btn" disabled={maintSaving}>
+                  {maintSaving ? 'Saving...' : 'Send to Maintenance'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL 9: MANAGE MAINTENANCE TASKS (maintenance_tasks <-> maintenance_records COST SYNC) */}
+      {managingMaintId &&
+        (() => {
+          const targetMaint = maintenance.find((m) => m.id === managingMaintId);
+          if (!targetMaint) return null;
+          const isOpen =
+            targetMaint.maintenance_status === 'pending' ||
+            targetMaint.maintenance_status === 'in_progress';
+          return (
+            <div
+              style={{
+                position: 'fixed',
+                inset: 0,
+                background: 'rgba(30, 20, 60, 0.45)',
+                backdropFilter: 'blur(6px)',
+                display: 'grid',
+                placeItems: 'center',
+                zIndex: 1000,
+                padding: 18,
+              }}
+            >
+              <div
+                style={{
+                  background: '#ffffff',
+                  borderRadius: 28,
+                  padding: 28,
+                  maxWidth: 640,
+                  width: '100%',
+                  maxHeight: '88vh',
+                  overflowY: 'auto',
+                  boxShadow: '0 25px 70px rgba(0,0,0,0.22)',
+                }}
+              >
+                <h2 style={{ fontSize: 20, fontWeight: 800, margin: '0 0 4px', color: '#111827' }}>
+                  Repair Tasks — {targetMaint.work_order_number}
+                </h2>
+                <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: '0 0 16px' }}>
+                  Total Work Order Cost: <strong>{formatPHP(targetMaint.total_maintenance_cost)}</strong>
+                </p>
+
+                <div className="table-responsive" style={{ marginBottom: 16 }}>
+                  <table className="finset-table">
+                    <thead>
+                      <tr>
+                        <th>CODE</th>
+                        <th>TASK</th>
+                        <th>HOURS &times; RATE</th>
+                        <th>COST</th>
+                        <th>STATUS</th>
+                        {isOpen && <th>ACTION</th>}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {(targetMaint.tasks || []).map((t) => (
+                        <tr key={t.id}>
+                          <td>
+                            <code>{t.task_code}</code>
+                          </td>
+                          <td>
+                            <div>
+                              <strong>{t.task_name}</strong>
+                            </div>
+                            {t.findings_report && (
+                              <small style={{ color: 'var(--text-muted)' }}>
+                                {t.findings_report}
+                              </small>
+                            )}
+                          </td>
+                          <td>
+                            {t.hours_logged}h &times; {formatPHP(t.hourly_labor_rate)}
+                          </td>
+                          <td style={{ fontWeight: 700 }}>{formatPHP(t.task_cost)}</td>
+                          <td>
+                            <span
+                              className={
+                                t.progress_status === 'completed'
+                                  ? 'confirmed-status-badge'
+                                  : 'pending-status-badge'
+                              }
+                            >
+                              {t.progress_status}
+                            </span>
+                          </td>
+                          {isOpen && (
+                            <td>
+                              <button
+                                type="button"
+                                className="delete-action-btn"
+                                style={{ padding: '4px 10px', fontSize: 11 }}
+                                onClick={() => handleRemoveMaintTask(t.id, targetMaint.id)}
+                              >
+                                Remove
+                              </button>
+                            </td>
+                          )}
+                        </tr>
+                      ))}
+                      {(targetMaint.tasks || []).length === 0 && (
+                        <tr>
+                          <td colSpan={6} style={{ textAlign: 'center', padding: 18, color: 'var(--text-muted)' }}>
+                            No tasks logged yet.
+                          </td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+
+                {isOpen ? (
+                  <form
+                    onSubmit={handleAddMaintTaskSubmit}
+                    className="auth-form-finset"
+                    style={{
+                      background: '#fafaff',
+                      border: '1px solid var(--border-subtle)',
+                      borderRadius: 16,
+                      padding: 16,
+                    }}
+                  >
+                    <h4 style={{ margin: '0 0 10px', fontSize: 13, fontWeight: 800 }}>
+                      + Add Repair Task to maintenance_tasks
+                    </h4>
+                    <div className="form-row">
+                      <div className="form-group">
+                        <label>Task Name</label>
+                        <input
+                          type="text"
+                          required
+                          placeholder="e.g. Replace shutter flex cable"
+                          value={newTaskName}
+                          onChange={(e) => setNewTaskName(e.target.value)}
+                        />
+                      </div>
+                      <div className="form-group">
+                        <label>Hours</label>
+                        <input
+                          type="number"
+                          min="0.5"
+                          step="0.5"
+                          value={newTaskHours}
+                          onChange={(e) => setNewTaskHours(e.target.value)}
+                          required
+                        />
+                      </div>
+                      <div className="form-group">
+                        <label>Rate / Hr (PHP)</label>
+                        <input
+                          type="number"
+                          min="1"
+                          step="0.01"
+                          value={newTaskRate}
+                          onChange={(e) => setNewTaskRate(e.target.value)}
+                          required
+                        />
+                      </div>
+                    </div>
+                    <div className="form-group">
+                      <label>Findings / Notes (Optional)</label>
+                      <input
+                        type="text"
+                        placeholder="Technician notes..."
+                        value={newTaskReport}
+                        onChange={(e) => setNewTaskReport(e.target.value)}
+                      />
+                    </div>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 10 }}>
+                      <button
+                        type="button"
+                        className="outline-pill-btn"
+                        onClick={() => setManagingMaintId(null)}
+                      >
+                        Close
+                      </button>
+                      <button type="submit" className="primary-purple-btn" disabled={taskSaving}>
+                        {taskSaving ? 'Adding...' : '+ Save Task'}
+                      </button>
+                    </div>
+                  </form>
+                ) : (
+                  <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+                    <button
+                      type="button"
+                      className="outline-pill-btn"
+                      onClick={() => setManagingMaintId(null)}
+                    >
+                      Close
+                    </button>
+                  </div>
+                )}
+              </div>
+            </div>
+          );
+        })()}
+
+      {/* MODAL 10: ADMIN MANAGE EQUIPMENT CATEGORIES (equipment_categories) */}
+      {isManageCategoriesOpen && (
+        <div
+          style={{
+            position: 'fixed',
+            inset: 0,
+            background: 'rgba(30, 20, 60, 0.45)',
+            backdropFilter: 'blur(6px)',
+            display: 'grid',
+            placeItems: 'center',
+            zIndex: 1000,
+            padding: 18,
+          }}
+        >
+          <div
+            style={{
+              background: '#ffffff',
+              borderRadius: 28,
+              padding: 28,
+              maxWidth: 600,
+              width: '100%',
+              maxHeight: '88vh',
+              overflowY: 'auto',
+              boxShadow: '0 25px 70px rgba(0,0,0,0.22)',
+            }}
+          >
+            <h2 style={{ fontSize: 20, fontWeight: 800, margin: '0 0 12px', color: '#111827' }}>
+              Equipment Categories ({categoriesList.length})
+            </h2>
+            <div className="table-responsive" style={{ marginBottom: 16 }}>
+              <table className="finset-table">
+                <thead>
+                  <tr>
+                    <th>CODE</th>
+                    <th>CATEGORY NAME</th>
+                    <th>INSURANCE / DAY</th>
+                    <th>ACTION</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {categoriesList.map((c) => (
+                    <tr key={c.id}>
+                      <td>
+                        <code>{c.category_code}</code>
+                      </td>
+                      <td>
+                        <strong>{c.category_name}</strong>
+                      </td>
+                      <td>{formatPHP(c.base_daily_insurance_rate)}</td>
+                      <td>
+                        <button
+                          type="button"
+                          className="delete-action-btn"
+                          style={{ padding: '4px 10px', fontSize: 11 }}
+                          onClick={() => handleDeleteCategory(c.id, c.category_name)}
+                        >
+                          Delete
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            <form onSubmit={handleCreateCategorySubmit} className="auth-form-finset">
+              <div className="form-row">
+                <div className="form-group">
+                  <label>Category Name</label>
+                  <input
+                    type="text"
+                    required
+                    placeholder="e.g. Action Cameras"
+                    value={catName}
+                    onChange={(e) => setCatName(e.target.value)}
+                  />
+                </div>
+                <div className="form-group">
+                  <label>Code (Unique)</label>
+                  <input
+                    type="text"
+                    required
+                    placeholder="e.g. ACT-CAM"
+                    value={catCode}
+                    onChange={(e) => setCatCode(e.target.value)}
+                  />
+                </div>
+                <div className="form-group">
+                  <label>Daily Insurance (PHP)</label>
+                  <input
+                    type="number"
+                    min="0"
+                    step="0.01"
+                    value={catInsuranceRate}
+                    onChange={(e) => setCatInsuranceRate(e.target.value)}
+                    required
+                  />
+                </div>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 12 }}>
+                <button
+                  type="button"
+                  className="outline-pill-btn"
+                  onClick={() => setIsManageCategoriesOpen(false)}
+                >
+                  Close
+                </button>
+                <button type="submit" className="primary-purple-btn">
+                  + Add Category
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL 11: ADMIN MANAGE STUDIO BRANCHES (warehouse_locations) */}
+      {isManageWarehousesOpen && (
+        <div
+          style={{
+            position: 'fixed',
+            inset: 0,
+            background: 'rgba(30, 20, 60, 0.45)',
+            backdropFilter: 'blur(6px)',
+            display: 'grid',
+            placeItems: 'center',
+            zIndex: 1000,
+            padding: 18,
+          }}
+        >
+          <div
+            style={{
+              background: '#ffffff',
+              borderRadius: 28,
+              padding: 28,
+              maxWidth: 640,
+              width: '100%',
+              maxHeight: '88vh',
+              overflowY: 'auto',
+              boxShadow: '0 25px 70px rgba(0,0,0,0.22)',
+            }}
+          >
+            <h2 style={{ fontSize: 20, fontWeight: 800, margin: '0 0 12px', color: '#111827' }}>
+              Studio Branches &amp; Warehouses ({warehousesList.length})
+            </h2>
+            <div className="table-responsive" style={{ marginBottom: 16 }}>
+              <table className="finset-table">
+                <thead>
+                  <tr>
+                    <th>CODE</th>
+                    <th>BRANCH NAME</th>
+                    <th>CITY</th>
+                    <th>CAPACITY</th>
+                    <th>ACTION</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {warehousesList.map((w) => (
+                    <tr key={w.id}>
+                      <td>
+                        <code>{w.branch_code}</code>
+                      </td>
+                      <td>
+                        <strong>{w.branch_name}</strong>
+                      </td>
+                      <td>{w.city}</td>
+                      <td>{w.max_storage_capacity}</td>
+                      <td>
+                        <button
+                          type="button"
+                          className="delete-action-btn"
+                          style={{ padding: '4px 10px', fontSize: 11 }}
+                          onClick={() => handleDeleteWarehouse(w.id, w.branch_name)}
+                        >
+                          Delete
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            <form onSubmit={handleCreateWarehouseSubmit} className="auth-form-finset">
+              <div className="form-row">
+                <div className="form-group">
+                  <label>Branch Code</label>
+                  <input
+                    type="text"
+                    required
+                    placeholder="e.g. MNL-BGC"
+                    value={whCode}
+                    onChange={(e) => setWhCode(e.target.value)}
+                  />
+                </div>
+                <div className="form-group">
+                  <label>Branch Name</label>
+                  <input
+                    type="text"
+                    required
+                    placeholder="e.g. BGC Studio Hub"
+                    value={whName}
+                    onChange={(e) => setWhName(e.target.value)}
+                  />
+                </div>
+              </div>
+              <div className="form-row">
+                <div className="form-group">
+                  <label>Address</label>
+                  <input
+                    type="text"
+                    required
+                    placeholder="26th St, Bonifacio Global City"
+                    value={whAddress}
+                    onChange={(e) => setWhAddress(e.target.value)}
+                  />
+                </div>
+                <div className="form-group">
+                  <label>City</label>
+                  <input
+                    type="text"
+                    required
+                    value={whCity}
+                    onChange={(e) => setWhCity(e.target.value)}
+                  />
+                </div>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 12 }}>
+                <button
+                  type="button"
+                  className="outline-pill-btn"
+                  onClick={() => setIsManageWarehousesOpen(false)}
+                >
+                  Close
+                </button>
+                <button type="submit" className="primary-purple-btn">
+                  + Add Branch
                 </button>
               </div>
             </form>
